@@ -1,0 +1,6 @@
+
+calcit.cirru -diff linguist-generated
+yarn.lock -diff linguist-generated
+Cargo.lock -diff linguist-generated
+lib -diff linguist-generated
+editing-history/* -diff linguist-generated

@@ -1,0 +1,6 @@
+[package]
+name = "cirru_edn_relay"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
