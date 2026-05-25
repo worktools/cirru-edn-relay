@@ -3,4 +3,16 @@ name = "cirru_edn_relay"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "edn-relay"
+path = "src/main.rs"
+
 [dependencies]
+anyhow = "1"
+cirru_edn = "0.7.7"
+clap = { version = "4.5", features = ["derive"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.24"
+uuid = { version = "1", features = ["fast-rng", "v4"] }
