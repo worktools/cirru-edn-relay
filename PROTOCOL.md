@@ -271,11 +271,12 @@ worker 或命令行可以主动从服务端拉取队列里的事件。
 
 `genui` 的 `payload` 不是任意业务对象，而是一棵布局树。当前约定节点字段如下:
 
-- `:type` 必填，字符串，支持 `"column"`、`"row"`、`"card"`、`"text"`、`"badge"`、`"divider"`、`"button"`、`"input"`
+- `:type` 必填，字符串，支持 `"column"`、`"row"`、`"card"`、`"text"`、`"badge"`、`"divider"`、`"markdown"`、`"mermaid"`、`"chart"`、`"button"`、`"input"`
 - `:children` 可选，列表，仅容器节点使用
-- `:text` 可选，给 `text`、`button`、`card` 标题使用
+- `:text` 可选，给 `text`、`button`、`card` 标题、`markdown`、`mermaid` 使用
 - `:placeholder` 可选，给 `input` 使用
 - `:name` 可选，给 `input` 使用
+- `:series` 可选，给 `chart` 使用，元素为 `{:label string :value number}`
 
 示例:
 
@@ -300,7 +301,8 @@ worker 或命令行可以主动从服务端拉取队列里的事件。
 - payload 必须是合法的 Cirru EDN
 - 根节点必须能反序列化为布局节点
 - 不支持的 `:type` 会直接报错
-- `text`/`badge`/`button` 节点要求非空 `:text`
+- `text`/`badge`/`button`/`markdown`/`mermaid` 节点要求非空 `:text`
+- `chart` 节点要求非空 `:series`，并且每个元素都要有非空 `:label` 与有限数值 `:value`
 - `input` 节点至少要有 `:name` 或 `:placeholder`
 
 如果本地校验失败，命令不会连 websocket，也不会把错误 layout 发给浏览器。

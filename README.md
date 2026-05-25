@@ -86,12 +86,16 @@ Expected result:
 - `text`
 - `badge`
 - `divider`
+- `markdown`
+- `mermaid`
+- `chart`
 - `button`
 - `input`
 
 Rules:
 
-- `text`, `badge`, and `button` require a non-empty `:text`
+- `text`, `badge`, `button`, `markdown`, and `mermaid` require a non-empty `:text`
+- `chart` requires a non-empty `:series`, and each item must provide string `:label` plus numeric `:value`
 - `input` requires `:name` or `:placeholder`
 - container nodes (`column`, `row`, `card`) recursively validate `:children`
 

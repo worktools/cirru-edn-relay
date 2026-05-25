@@ -120,7 +120,15 @@ struct GenUiLayoutNode {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
+    series: Vec<GenUiChartItem>,
+    #[serde(default)]
     children: Vec<GenUiLayoutNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GenUiChartItem {
+    label: String,
+    value: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -935,6 +943,9 @@ fn validate_genui_node(node: &GenUiLayoutNode, path: &str) -> Result<()> {
         "badge" => require_string_field(path, "text", node.text.as_deref()),
         "divider" => Ok(()),
         "button" => require_string_field(path, "text", node.text.as_deref()),
+        "markdown" => require_string_field(path, "text", node.text.as_deref()),
+        "mermaid" => require_string_field(path, "text", node.text.as_deref()),
+        "chart" => validate_chart_series(&node.series, path),
         "input" => {
             if node.name.as_deref().is_none() && node.placeholder.as_deref().is_none() {
                 bail!("{path} input node requires at least one of `name` or `placeholder`");
@@ -950,6 +961,23 @@ fn require_string_field(path: &str, field_name: &str, value: Option<&str>) -> Re
         Some(value) if !value.is_empty() => Ok(()),
         _ => bail!("{path} requires a non-empty `{field_name}` field"),
     }
+}
+
+fn validate_chart_series(series: &[GenUiChartItem], path: &str) -> Result<()> {
+    if series.is_empty() {
+        bail!("{path} chart node requires non-empty `series`");
+    }
+
+    for (index, item) in series.iter().enumerate() {
+        if item.label.is_empty() {
+            bail!("{path}.series[{index}] requires non-empty `label`");
+        }
+        if !item.value.is_finite() {
+            bail!("{path}.series[{index}] requires finite `value`");
+        }
+    }
+
+    Ok(())
 }
 
 fn parse_edn_text(text: &str, label: &str) -> Result<Edn> {
