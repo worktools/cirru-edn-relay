@@ -4,11 +4,12 @@
 
 ## 1. 总体约定
 
-- websocket 地址示例: `ws://127.0.0.1:9001`
+- websocket 地址示例: `ws://127.0.0.1:9100`
 - 每一帧都是一个 Cirru EDN map，对应 Rust 侧的 `WireMessage`
 - 顶层字段名固定，采用 snake_case
 - `payload` 字段直接承载 Cirru EDN 数据，不再把数据额外包一层字符串
-- `channel` 用于路由消息，同一个 channel 可以有多个浏览器或 worker 订阅
+- `channel` 用于路由消息，同一个 channel 可以有多个 sender、receiver 或 worker
+- 只要某个 channel 里还有任意一方在线，该 channel 就视为存在；所有连接退出后该 channel 消失
 - `id` 是一次请求-回执往返的唯一标识，建议由发送方生成 UUID
 - 服务端收到 `request` 后，若当前没有在线订阅者，则进入队列；后续可被订阅连接自动取到，或者由 `poll` 主动拉取
 
@@ -21,16 +22,16 @@
 字段说明:
 
 - `kind`: 固定为 `"hello"`
-- `role`: `"browser"`、`"cli"`、`"worker"` 三选一
+- `role`: `"receiver"`、`"sender"`、`"worker"`；当前仍兼容旧值 `"browser"` 和 `"cli"`
 - `client_id`: 可选，客户端自定义标识；不传时由服务端回填 session id
-- `channels`: 可选数组，表示当前连接要订阅的频道列表
+- `channels`: 可选数组，表示当前连接当前要加入的频道列表；browser/receiver 通常只放 0 或 1 个
 
 示例:
 
 ```cirru
 {}
   :kind |hello
-  :role |browser
+  :role |receiver
   :client_id |page-main
   :channels $ [] |demo
 ```
@@ -41,6 +42,7 @@
 
 - `kind`: 固定为 `"hello-ok"`
 - `client_id`: 服务端最终确认的连接标识
+- `channels`: 当前活跃的 channel 列表
 
 示例:
 
@@ -48,6 +50,22 @@
 {}
   :kind |hello-ok
   :client_id |page-main
+  :channels $ [] |demo
+```
+
+### channel-state
+
+当活跃 channel 列表变化时，服务端会向在线连接广播:
+
+- `kind`: 固定为 `"channel-state"`
+- `channels`: 当前活跃的 channel 列表
+
+示例:
+
+```cirru
+{}
+  :kind |channel-state
+  :channels $ [] |alpha |beta
 ```
 
 ## 3. 请求与回执
@@ -130,7 +148,7 @@
 
 - 成功回执: `ok = true`，可附带 `payload`
 - 失败回执: `ok = false`，建议附带 `error`
-- 同一个 `id` 只接受第一条有效回执，后续重复回执会得到错误
+- 同一个 `id` 只接受第一条有效回执，后续重复回执不会再转发给 sender，而是给晚到的 responder 返回 `warning`
 
 成功回执示例:
 
@@ -158,6 +176,15 @@
 
 - `kind`: 固定为 `"reply-accepted"`
 - `id`: 已确认路由的请求 id
+
+### warning
+
+服务端在不需要中断连接、但需要提示行为被忽略时返回:
+
+- `kind`: 固定为 `"warning"`
+- `error`: 警告文本
+
+目前主要用于多 receiver 场景下的重复 `ack`。
 
 ## 4. 队列拉取
 
@@ -207,7 +234,7 @@ worker 或命令行可以主动从服务端拉取队列里的事件。
 
 - `poll` 会把事件从服务端队列中弹出
 - 如果 `poll` 后没有发送 `ack`，原始发送方会持续等待直到超时或断开
-- 因此 `poll` 适合接 worker 进程，worker 拉取后应自行调用 `reply` 或直接实现 websocket 回执
+- 因此 `poll` 适合接 worker 进程，worker 拉取后应自行实现 websocket 回执
 
 ## 5. 错误帧
 
@@ -231,18 +258,18 @@ worker 或命令行可以主动从服务端拉取队列里的事件。
 ### 6.1 浏览器常驻订阅
 
 1. 建立 websocket 连接
-2. 发送 `hello(role=browser, channels=[...])`
-3. 等待 `hello-ok`
+2. 发送 `hello(role=receiver, channels=[当前选中的 channel])`
+3. 等待 `hello-ok` 和后续的 `channel-state`
 4. 持续接收 `event`
 5. 处理完成后发送 `ack`
 
 ### 6.2 命令行发送并等待回执
 
 1. 建立 websocket 连接
-2. 发送 `hello(role=cli)`
+2. 发送 `hello(role=sender, channels=[本次命令显式传入的 channel])`
 3. 发送 `request`
 4. 收到 `accepted`
-5. 等待服务端转发回来的 `ack`
+5. 等待服务端转发回来的第一条 `ack`
 
 ### 6.3 worker 拉取队列任务
 
@@ -251,32 +278,30 @@ worker 或命令行可以主动从服务端拉取队列里的事件。
 3. 发送 `poll`
 4. 收到 `poll-result`
 5. 逐条处理事件
-6. 使用 `reply` 或自定义 websocket 客户端发 `ack`
+6. 使用 websocket 客户端直接发送 `ack`
 
 ## 7. CLI 对应关系
 
 - `serve`: 启动中继服务，并把当前 relay 目标写入本地状态
 - `current`: 查看当前 relay 上下文
-- `status`: 向 renderer 查询当前页面状态
+- `status`: 通过 `--channel <name>` 向对应 renderer 查询页面状态
 - `open`: 查询当前 renderer 页面地址并交给系统浏览器打开
-- `genui`: 向固定的 `genui` channel 发送经过校验的布局描述，并等待浏览器确认已经存入 store 且可渲染
 - `help`: 向 renderer 查询帮助文档
 - `skill`: 向 renderer 查询 skill 文本
-- `send`: 发送 `request` 并阻塞等待 `ack`
+- `send`: 发送 `request` 并阻塞等待 `ack`，命令最后一个位置参数直接作为 `payload`
 - `poll`: 拉取指定 channel 的队列事件
-- `reply`: 发送 `ack`
 
 当前 `help` / `skill` 一类高层命令不应把文档硬编码在 CLI 内部，而是通过协议向当前 renderer 查询。
 
 当前 CLI 的 stdout 都输出协议帧本身的 Cirru EDN 文本，或直接输出 renderer 返回的文本内容，便于脚本继续解析。
 
-## 8. renderer 文档查询频道约定
+## 8. renderer 请求约定
 
-除了 `genui` 以外，当前还保留一个 `renderer` 频道，用于查询 renderer 暴露的运行时文档能力。
+renderer 的 `help` / `skill` / `status` 与布局投递都走命令显式指定的 channel，不再额外保留一个固定 `renderer` 频道。
 
 ### 8.1 `help` 请求
 
-CLI 通过 `request(channel=renderer)` 发送：
+CLI 通过 `request(channel=<命令行 --channel>)` 发送：
 
 ```cirru
 {}
@@ -299,7 +324,7 @@ renderer 成功处理后，返回 `ack(ok=true)`，其中 `payload` 为一段 Ci
 
 ### 8.2 `skill` 请求
 
-CLI 通过 `request(channel=renderer)` 发送：
+CLI 通过 `request(channel=<命令行 --channel>)` 发送：
 
 ```cirru
 {}
@@ -318,7 +343,7 @@ renderer 成功处理后，返回 `ack(ok=true)`，其中 `payload` 至少包含
 
 ### 8.3 `status` 请求
 
-CLI 通过 `request(channel=renderer)` 发送：
+CLI 通过 `request(channel=<命令行 --channel>)` 发送：
 
 ```cirru
 {}
@@ -333,70 +358,21 @@ renderer 成功处理后，返回 `ack(ok=true)`，其中 `payload` 至少包含
 - `:title`
 - `:page_url`
 - `:commands`
+- `:channel`
+- `:channels`
 
 `open` 命令可以基于这份返回结果里的 `:page_url` 调用系统浏览器。
 
-## 9. `genui` 频道约定
+## 9. receiver 侧 payload 约定
 
-`genui` 是给 `edn-renderer` 这类前端渲染器使用的保留频道。
+像 `genui` 这样的 channel 名称只是发送方与 receiver 之间的约定。relay 只负责转发 Cirru EDN `payload`，不在 CLI 或协议层硬编码具体的数据结构。
 
-### 8.1 请求载荷
+如果某个 receiver 约定了特定 payload 形状、校验规则或 ack 内容，应由该 receiver 自己的文档定义，例如 `edn-renderer` 的运行时协议说明。
 
-`genui` 的 `payload` 不是任意业务对象，而是一棵布局树。当前约定节点字段如下:
-
-- `:type` 必填，字符串，支持 `"column"`、`"row"`、`"card"`、`"text"`、`"badge"`、`"divider"`、`"markdown"`、`"mermaid"`、`"chart"`、`"button"`、`"input"`
-- `:children` 可选，列表，仅容器节点使用
-- `:text` 可选，给 `text`、`button`、`card` 标题、`markdown`、`mermaid` 使用
-- `:placeholder` 可选，给 `input` 使用
-- `:name` 可选，给 `input` 使用
-- `:series` 可选，给 `chart` 使用，元素为 `{:label string :value number}`
-
-示例:
-
-```cirru
-{}
-  :type |card
-  :text "|Demo Card"
-  :children $ []
-    {} (:type |badge) (:text |preview)
-    {} (:type |divider)
-    {} (:type |text) (:text "|Hello from genui")
-    {} (:type |row)
-      :children $ []
-        {} (:type |button) (:text |Confirm)
-        {} (:type |input) (:name |email) (:placeholder |Email)
-```
-
-### 8.2 本地校验
-
-`genui` 命令在发消息之前会先做一轮本地校验:
-
-- payload 必须是合法的 Cirru EDN
-- 根节点必须能反序列化为布局节点
-- 不支持的 `:type` 会直接报错
-- `text`/`badge`/`button`/`markdown`/`mermaid` 节点要求非空 `:text`
-- `chart` 节点要求非空 `:series`，并且每个元素都要有非空 `:label` 与有限数值 `:value`
-- `input` 节点至少要有 `:name` 或 `:placeholder`
-
-如果本地校验失败，命令不会连 websocket，也不会把错误 layout 发给浏览器。
-
-### 8.3 浏览器回执
-
-浏览器成功接收并应用 layout 后，会返回 `ack(ok=true)`，其中 `payload` 也是一段 Cirru EDN 数据，格式如下:
-
-```cirru
-{}
-  :status |ok
-  :layout_id |layout-<request-id>
-```
-
-浏览器侧如果拒绝渲染，应返回 `ack(ok=false)` 并在 `error` 字段中放入可读错误文本。
-
-### 8.4 推荐流程
+推荐流程仍然是：
 
 1. 用户启动 `serve`
-2. 浏览器打开 `edn-renderer`，自动连接 relay，并订阅 `genui`
-3. 命令行执行 `genui <LAYOUT>`
-4. relay 把 `event(channel=genui)` 投递给浏览器
-5. 浏览器把 layout 写入自己的 store 并渲染
-6. 浏览器回 `ack`，CLI 打印 `genui ok <layout-id>`
+2. 浏览器打开 receiver 页面，并通过 URL 参数如 `?channel=genui` 选中 channel；如果 relay 端口被改过，也可以通过 `?port=<PORT>` 指向同一个端口
+3. 发送方把约定好的 Cirru EDN 数据作为 `request(channel=genui)` 的 `payload` 发给 relay
+4. relay 把 `event(channel=genui)` 投递给 receiver
+5. receiver 按自己的约定处理 payload 并返回 `ack`

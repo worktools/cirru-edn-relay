@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow, bail};
 use cirru_edn::{Edn, EdnListView, EdnMapView};
 use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fmt::Write as _;
@@ -18,7 +18,11 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, accept_async, connect_a
 use uuid::Uuid;
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Cirru EDN websocket relay", disable_help_subcommand = true)]
+#[command(
+    version,
+    about = "Cirru EDN websocket relay",
+    disable_help_subcommand = true
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -27,83 +31,79 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     Serve {
+        /// Bind address for the relay server. Defaults to the saved target or 127.0.0.1:9100.
         #[arg(long)]
         bind: Option<String>,
     },
-    Genui {
-        layout: String,
-        #[arg(long)]
-        server: Option<String>,
-        #[arg(long)]
-        client_id: Option<String>,
-        #[arg(long, default_value_t = 30)]
-        timeout_secs: u64,
-    },
     Help {
+        /// Optional help topics to query from the receiver.
         topics: Vec<String>,
+        /// Channel name for this request.
         #[arg(long)]
-        server: Option<String>,
+        channel: String,
+        /// Override the sender client id for this request.
         #[arg(long)]
         client_id: Option<String>,
+        /// Timeout in seconds while waiting for an ack.
         #[arg(long, default_value_t = 30)]
         timeout_secs: u64,
     },
     Skill {
+        /// Channel name for this request.
         #[arg(long)]
-        server: Option<String>,
+        channel: String,
+        /// Override the sender client id for this request.
         #[arg(long)]
         client_id: Option<String>,
+        /// Timeout in seconds while waiting for an ack.
         #[arg(long, default_value_t = 30)]
         timeout_secs: u64,
     },
     Status {
+        /// Channel name for this request.
         #[arg(long)]
-        server: Option<String>,
+        channel: String,
+        /// Override the sender client id for this request.
         #[arg(long)]
         client_id: Option<String>,
+        /// Timeout in seconds while waiting for an ack.
         #[arg(long, default_value_t = 30)]
         timeout_secs: u64,
     },
     Current,
     Open {
+        /// Channel name for this request.
         #[arg(long)]
-        server: Option<String>,
+        channel: String,
+        /// Override the sender client id for this request.
         #[arg(long)]
         client_id: Option<String>,
+        /// Timeout in seconds while waiting for an ack.
         #[arg(long, default_value_t = 30)]
         timeout_secs: u64,
     },
     Send {
-        #[arg(long)]
-        server: Option<String>,
+        /// Channel name for this request.
         #[arg(long)]
         channel: String,
-        #[arg(long)]
+        /// Cirru EDN payload to send.
+        #[arg(value_name = "INPUT")]
         payload: String,
+        /// Override the sender client id for this request.
         #[arg(long)]
         client_id: Option<String>,
+        /// Timeout in seconds while waiting for an ack.
         #[arg(long, default_value_t = 30)]
         timeout_secs: u64,
     },
     Poll {
-        #[arg(long)]
-        server: Option<String>,
+        /// Channel name to poll.
         #[arg(long)]
         channel: String,
+        /// Maximum number of queued events to return.
         #[arg(long, default_value_t = 10)]
         limit: usize,
-        #[arg(long)]
-        client_id: Option<String>,
-    },
-    Reply {
-        #[arg(long)]
-        server: Option<String>,
-        #[arg(long)]
-        id: String,
-        #[arg(long)]
-        payload: Option<String>,
-        #[arg(long)]
-        error: Option<String>,
+        /// Override the worker client id for this request.
         #[arg(long)]
         client_id: Option<String>,
     },
@@ -148,34 +148,6 @@ struct QueuedEvent {
     payload: Edn,
 }
 
-#[derive(Debug, Deserialize)]
-struct GenUiLayoutNode {
-    #[serde(rename = "type")]
-    node_type: String,
-    #[serde(default)]
-    text: Option<String>,
-    #[serde(default)]
-    placeholder: Option<String>,
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    series: Vec<GenUiChartItem>,
-    #[serde(default)]
-    children: Vec<GenUiLayoutNode>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GenUiChartItem {
-    label: String,
-    value: f64,
-}
-
-#[derive(Debug, Deserialize)]
-struct GenUiAckPayload {
-    layout_id: String,
-    status: String,
-}
-
 impl WireMessage {
     fn hello(role: impl Into<String>, client_id: Option<String>, channels: Vec<String>) -> Self {
         Self {
@@ -187,10 +159,19 @@ impl WireMessage {
         }
     }
 
-    fn hello_ok(client_id: String) -> Self {
+    fn hello_ok(client_id: String, channels: Vec<String>) -> Self {
         Self {
             kind: "hello-ok".into(),
             client_id: Some(client_id),
+            channels,
+            ..Self::default()
+        }
+    }
+
+    fn channel_state(channels: Vec<String>) -> Self {
+        Self {
+            kind: "channel-state".into(),
+            channels,
             ..Self::default()
         }
     }
@@ -271,14 +252,21 @@ impl WireMessage {
             ..Self::default()
         }
     }
+
+    fn warning(message: impl Into<String>) -> Self {
+        Self {
+            kind: "warning".into(),
+            error: Some(message.into()),
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Default)]
 struct RelayState {
     clients: HashMap<String, ClientState>,
-    subscriptions: HashMap<String, HashSet<String>>,
-    queues: HashMap<String, VecDeque<QueuedEvent>>,
-    pending_replies: HashMap<String, String>,
+    channels: HashMap<String, ChannelState>,
+    pending_replies: HashMap<String, PendingReply>,
 }
 
 struct ClientState {
@@ -286,6 +274,24 @@ struct ClientState {
     role: String,
     client_id: String,
     channels: HashSet<String>,
+}
+
+#[derive(Default)]
+struct ChannelState {
+    members: HashSet<String>,
+    receivers: HashSet<String>,
+    queue: VecDeque<PendingEvent>,
+}
+
+struct PendingEvent {
+    event: QueuedEvent,
+    requester_session: String,
+}
+
+struct PendingReply {
+    requester_session: String,
+    channel: String,
+    acked_by: Option<String>,
 }
 
 #[derive(Clone)]
@@ -297,11 +303,9 @@ struct Outbound {
 type ClientSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const DEFAULT_BIND: &str = "127.0.0.1:9100";
-const RENDERER_CHANNEL: &str = "renderer";
-
 #[derive(Debug, Clone)]
 struct RelayCliState {
-    server: String,
+    server: Option<String>,
 }
 
 #[tokio::main]
@@ -318,59 +322,44 @@ async fn run() -> Result<()> {
     match cli.command {
         Command::Serve { bind } => {
             let bind = resolve_bind(bind)?;
-            save_cli_state(&RelayCliState {
-                server: server_url_from_bind(&bind),
-            })?;
+            let mut state = load_cli_state()?.unwrap_or(RelayCliState { server: None });
+            state.server = Some(server_url_from_bind(&bind));
+            save_cli_state(&state)?;
             run_server(bind).await
         }
-        Command::Genui {
-            server,
-            layout,
-            client_id,
-            timeout_secs,
-        } => run_genui(resolve_server(server)?, layout, client_id, timeout_secs).await,
         Command::Help {
-            server,
             topics,
+            channel,
             client_id,
             timeout_secs,
-        } => run_help(resolve_server(server)?, topics, client_id, timeout_secs).await,
+        } => run_help(resolve_server()?, channel, topics, client_id, timeout_secs).await,
         Command::Skill {
-            server,
+            channel,
             client_id,
             timeout_secs,
-        } => run_skill(resolve_server(server)?, client_id, timeout_secs).await,
+        } => run_skill(resolve_server()?, channel, client_id, timeout_secs).await,
         Command::Status {
-            server,
+            channel,
             client_id,
             timeout_secs,
-        } => run_status(resolve_server(server)?, client_id, timeout_secs).await,
+        } => run_status(resolve_server()?, channel, client_id, timeout_secs).await,
         Command::Current => run_current(),
         Command::Open {
-            server,
+            channel,
             client_id,
             timeout_secs,
-        } => run_open(resolve_server(server)?, client_id, timeout_secs).await,
+        } => run_open(resolve_server()?, channel, client_id, timeout_secs).await,
         Command::Send {
-            server,
             channel,
             payload,
             client_id,
             timeout_secs,
-        } => run_send(resolve_server(server)?, channel, payload, client_id, timeout_secs).await,
+        } => run_send(resolve_server()?, channel, payload, client_id, timeout_secs).await,
         Command::Poll {
-            server,
             channel,
             limit,
             client_id,
-        } => run_poll(resolve_server(server)?, channel, limit, client_id).await,
-        Command::Reply {
-            server,
-            id,
-            payload,
-            error,
-            client_id,
-        } => run_reply(resolve_server(server)?, id, payload, error, client_id).await,
+        } => run_poll(resolve_server()?, channel, limit, client_id).await,
     }
 }
 
@@ -404,7 +393,7 @@ fn load_cli_state() -> Result<Option<RelayCliState>> {
     let text = fs::read_to_string(&path)?;
     let edn = parse_edn_text(&text, "relay state file")?;
     let map = expect_map(edn, "relay state file")?;
-    let server = required_map_string(&map, "server")?;
+    let server = map_string(&map, "server")?;
     Ok(Some(RelayCliState { server }))
 }
 
@@ -414,7 +403,11 @@ fn save_cli_state(state: &RelayCliState) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
 
-    let edn = Edn::map_from_iter([(Edn::tag("server"), Edn::str(state.server.clone()))]);
+    let mut pairs = Vec::new();
+    if let Some(server) = &state.server {
+        pairs.push((Edn::tag("server"), Edn::str(server.clone())));
+    }
+    let edn = Edn::map_from_iter(pairs);
     let text = cirru_edn::format(&edn, true)
         .map_err(|error| anyhow!("failed to format relay state file: {error}"))?;
     fs::write(path, text)?;
@@ -431,21 +424,21 @@ fn resolve_bind(bind: Option<String>) -> Result<String> {
     }
 
     if let Some(state) = load_cli_state()? {
-        if let Some(bind) = state.server.strip_prefix("ws://") {
-            return Ok(bind.to_string());
+        if let Some(server) = state.server {
+            if let Some(bind) = server.strip_prefix("ws://") {
+                return Ok(bind.to_string());
+            }
         }
     }
 
     Ok(DEFAULT_BIND.to_string())
 }
 
-fn resolve_server(server: Option<String>) -> Result<String> {
-    if let Some(server) = server {
-        return Ok(server);
-    }
-
+fn resolve_server() -> Result<String> {
     if let Some(state) = load_cli_state()? {
-        return Ok(state.server);
+        if let Some(server) = state.server {
+            return Ok(server);
+        }
     }
 
     bail!("no relay target configured; run `edn-relay serve` first")
@@ -465,39 +458,9 @@ async fn run_send(
     Ok(())
 }
 
-async fn run_genui(
-    server: String,
-    layout: String,
-    client_id: Option<String>,
-    timeout_secs: u64,
-) -> Result<()> {
-    let layout = parse_edn_text(&layout, "genui layout")?;
-    validate_genui_layout(&layout)?;
-    let ack =
-        send_request_and_wait_for_ack(server, "genui".into(), layout, client_id, timeout_secs)
-            .await?;
-
-    if !ack.ok.unwrap_or(false) {
-        bail!(
-            ack.error
-                .unwrap_or_else(|| "browser rejected the genui layout".into())
-        );
-    }
-
-    let payload = ack
-        .payload
-        .ok_or_else(|| anyhow!("browser ack is missing genui payload"))?;
-    let result: GenUiAckPayload = decode_edn(payload, "genui ack payload")?;
-    if result.status != "ok" {
-        bail!("unexpected genui ack status: {}", result.status);
-    }
-
-    println!("genui ok {}", result.layout_id);
-    Ok(())
-}
-
 async fn run_help(
     server: String,
+    channel: String,
     topics: Vec<String>,
     client_id: Option<String>,
     timeout_secs: u64,
@@ -509,36 +472,30 @@ async fn run_help(
             Edn::List(EdnListView(topics.into_iter().map(Edn::str).collect())),
         ),
     ]);
-    let ack = send_request_and_wait_for_ack(
-        server,
-        RENDERER_CHANNEL.into(),
-        payload,
-        client_id,
-        timeout_secs,
-    )
-    .await?;
+    let ack =
+        send_request_and_wait_for_ack(server, channel, payload, client_id, timeout_secs).await?;
     print_renderer_response(ack)
 }
 
 async fn run_skill(
     server: String,
+    channel: String,
     client_id: Option<String>,
     timeout_secs: u64,
 ) -> Result<()> {
     let payload = Edn::map_from_iter([(Edn::tag("op"), Edn::str("skill".to_owned()))]);
-    let ack = send_request_and_wait_for_ack(
-        server,
-        RENDERER_CHANNEL.into(),
-        payload,
-        client_id,
-        timeout_secs,
-    )
-    .await?;
+    let ack =
+        send_request_and_wait_for_ack(server, channel, payload, client_id, timeout_secs).await?;
     print_renderer_response(ack)
 }
 
-async fn run_status(server: String, client_id: Option<String>, timeout_secs: u64) -> Result<()> {
-    let status = fetch_renderer_status(server, client_id, timeout_secs).await?;
+async fn run_status(
+    server: String,
+    channel: String,
+    client_id: Option<String>,
+    timeout_secs: u64,
+) -> Result<()> {
+    let status = fetch_renderer_status(server, channel, client_id, timeout_secs).await?;
     print_renderer_status(&status)
 }
 
@@ -548,7 +505,10 @@ fn run_current() -> Result<()> {
         Some(state) => {
             println!("当前 relay 上下文");
             println!("  状态文件: {}", path.display());
-            println!("  server: {}", state.server);
+            println!(
+                "  server: {}",
+                state.server.unwrap_or_else(|| "(unset)".into())
+            );
             Ok(())
         }
         None => {
@@ -560,8 +520,13 @@ fn run_current() -> Result<()> {
     }
 }
 
-async fn run_open(server: String, client_id: Option<String>, timeout_secs: u64) -> Result<()> {
-    let status = fetch_renderer_status(server, client_id, timeout_secs).await?;
+async fn run_open(
+    server: String,
+    channel: String,
+    client_id: Option<String>,
+    timeout_secs: u64,
+) -> Result<()> {
+    let status = fetch_renderer_status(server, channel, client_id, timeout_secs).await?;
     open_url(&status.page_url)?;
     println!("opened {}", status.page_url);
     Ok(())
@@ -569,18 +534,13 @@ async fn run_open(server: String, client_id: Option<String>, timeout_secs: u64) 
 
 async fn fetch_renderer_status(
     server: String,
+    channel: String,
     client_id: Option<String>,
     timeout_secs: u64,
 ) -> Result<RendererStatusPayload> {
     let payload = Edn::map_from_iter([(Edn::tag("op"), Edn::str("status".to_owned()))]);
-    let ack = send_request_and_wait_for_ack(
-        server,
-        RENDERER_CHANNEL.into(),
-        payload,
-        client_id,
-        timeout_secs,
-    )
-    .await?;
+    let ack =
+        send_request_and_wait_for_ack(server, channel, payload, client_id, timeout_secs).await?;
 
     if !ack.ok.unwrap_or(false) {
         bail!(
@@ -866,7 +826,7 @@ async fn send_request_and_wait_for_ack(
 
     send_client_frame(
         &mut socket,
-        &WireMessage::hello("cli", client_id, Vec::new()),
+        &WireMessage::hello("sender", client_id, vec![channel.clone()]),
     )
     .await?;
     send_client_frame(
@@ -883,6 +843,7 @@ async fn send_request_and_wait_for_ack(
 
             match frame.kind.as_str() {
                 "hello-ok" | "accepted" => continue,
+                "warning" => continue,
                 "ack" if frame.id.as_deref() == Some(request_id.as_str()) => return Ok(frame),
                 "error" => {
                     let message = frame
@@ -909,7 +870,7 @@ async fn run_poll(
     let mut socket = connect_client(&server).await?;
     send_client_frame(
         &mut socket,
-        &WireMessage::hello("worker", client_id, Vec::new()),
+        &WireMessage::hello("worker", client_id, vec![channel.clone()]),
     )
     .await?;
     send_client_frame(
@@ -926,53 +887,6 @@ async fn run_poll(
         match frame.kind.as_str() {
             "hello-ok" => continue,
             "poll-result" if frame.channel.as_deref() == Some(channel.as_str()) => {
-                println!("{}", encode_frame(&frame)?);
-                return Ok(());
-            }
-            "error" => {
-                let message = frame
-                    .error
-                    .unwrap_or_else(|| "server returned an error".into());
-                bail!(message);
-            }
-            _ => continue,
-        }
-    }
-}
-
-async fn run_reply(
-    server: String,
-    id: String,
-    payload: Option<String>,
-    error: Option<String>,
-    client_id: Option<String>,
-) -> Result<()> {
-    let payload = match payload {
-        Some(payload) => Some(parse_edn_text(&payload, "reply payload")?),
-        None => None,
-    };
-
-    let ok = error.is_none();
-    let mut socket = connect_client(&server).await?;
-    send_client_frame(
-        &mut socket,
-        &WireMessage::hello("cli", client_id, Vec::new()),
-    )
-    .await?;
-    send_client_frame(
-        &mut socket,
-        &WireMessage::ack(id.clone(), ok, payload, error),
-    )
-    .await?;
-
-    loop {
-        let Some(frame) = read_client_frame(&mut socket).await? else {
-            bail!("server closed the connection before confirming the reply");
-        };
-
-        match frame.kind.as_str() {
-            "hello-ok" => continue,
-            "reply-accepted" if frame.id.as_deref() == Some(id.as_str()) => {
                 println!("{}", encode_frame(&frame)?);
                 return Ok(());
             }
@@ -1100,18 +1014,22 @@ async fn process_hello(
     frame: WireMessage,
 ) -> Result<Vec<Outbound>> {
     let role = required_field(frame.role, "role")?;
-    if !matches!(role.as_str(), "browser" | "cli" | "worker") {
+    if !matches!(
+        role.as_str(),
+        "browser" | "receiver" | "cli" | "sender" | "worker"
+    ) {
         bail!("invalid role: {role}");
     }
 
     let resolved_client_id = frame.client_id.unwrap_or_else(|| session_id.to_string());
+    let receives_events = client_receives_events(&role);
     let requested_channels: HashSet<String> = frame
         .channels
         .into_iter()
         .filter(|channel| !channel.is_empty())
         .collect();
 
-    let (sender, queued_events) = {
+    let (sender, queued_events, channel_frames) = {
         let mut state = state.lock().await;
         let sender = state
             .clients
@@ -1125,17 +1043,18 @@ async fn process_hello(
             .map(|client| client.channels.clone())
             .unwrap_or_default();
 
-        let mut empty_subscriptions = Vec::new();
+        let mut removed_channels = Vec::new();
         for channel in &previous_channels {
-            if let Some(members) = state.subscriptions.get_mut(channel) {
-                members.remove(session_id);
-                if members.is_empty() {
-                    empty_subscriptions.push(channel.clone());
+            if let Some(channel_state) = state.channels.get_mut(channel) {
+                channel_state.members.remove(session_id);
+                channel_state.receivers.remove(session_id);
+                if channel_state.members.is_empty() {
+                    removed_channels.push(channel.clone());
                 }
             }
         }
-        for channel in empty_subscriptions {
-            state.subscriptions.remove(&channel);
+        for channel in removed_channels {
+            state.channels.remove(&channel);
         }
 
         if let Some(client) = state.clients.get_mut(session_id) {
@@ -1145,36 +1064,45 @@ async fn process_hello(
         }
 
         for channel in &requested_channels {
-            state
-                .subscriptions
-                .entry(channel.clone())
-                .or_default()
-                .insert(session_id.to_string());
+            let channel_state = state.channels.entry(channel.clone()).or_default();
+            channel_state.members.insert(session_id.to_string());
+            if receives_events {
+                channel_state.receivers.insert(session_id.to_string());
+            }
         }
 
         let mut queued_events = Vec::new();
-        let mut empty_queues = Vec::new();
-        for channel in &requested_channels {
-            if let Some(queue) = state.queues.get_mut(channel) {
-                while let Some(event) = queue.pop_front() {
-                    queued_events.push(event);
+        if receives_events {
+            let mut emptied_channels = Vec::new();
+            for channel in &requested_channels {
+                if let Some(channel_state) = state.channels.get_mut(channel) {
+                    while let Some(event) = channel_state.queue.pop_front() {
+                        queued_events.push(event.event);
+                    }
+                    if channel_state.queue.is_empty() {
+                        emptied_channels.push(channel.clone());
+                    }
                 }
-                if queue.is_empty() {
-                    empty_queues.push(channel.clone());
+            }
+            for channel in emptied_channels {
+                if let Some(channel_state) = state.channels.get(&channel) {
+                    if channel_state.members.is_empty() {
+                        state.channels.remove(&channel);
+                    }
                 }
             }
         }
-        for channel in empty_queues {
-            state.queues.remove(&channel);
-        }
 
-        (sender, queued_events)
+        let channel_frames = channel_state_actions(&state);
+
+        (sender, queued_events, channel_frames)
     };
 
     let mut actions = vec![Outbound {
         sender: sender.clone(),
-        frame: WireMessage::hello_ok(resolved_client_id),
+        frame: WireMessage::hello_ok(resolved_client_id, active_channel_names(&channel_frames)),
     }];
+    actions.extend(channel_frames);
     for event in queued_events {
         actions.push(Outbound {
             sender: sender.clone(),
@@ -1195,7 +1123,13 @@ async fn process_request(
 
     let expects_reply = frame.expects_reply.unwrap_or(true);
     let (requester_sender, requester_id, recipients) = {
-        let state = state.lock().await;
+        let mut state = state.lock().await;
+        if let Some(client) = state.clients.get_mut(session_id) {
+            client.channels.insert(channel.clone());
+        }
+        let channel_state = state.channels.entry(channel.clone()).or_default();
+        channel_state.members.insert(session_id.to_string());
+
         let requester_sender = state
             .clients
             .get(session_id)
@@ -1207,10 +1141,10 @@ async fn process_request(
             .map(|client| client.client_id.clone())
             .unwrap_or_else(|| session_id.to_string());
         let recipients = state
-            .subscriptions
+            .channels
             .get(&channel)
             .into_iter()
-            .flat_map(|members| members.iter())
+            .flat_map(|channel_state| channel_state.receivers.iter())
             .filter(|member| member.as_str() != session_id)
             .filter_map(|member| {
                 state
@@ -1232,22 +1166,36 @@ async fn process_request(
     let status = if recipients.is_empty() {
         let mut state = state.lock().await;
         if expects_reply {
-            state
-                .pending_replies
-                .insert(id.clone(), session_id.to_string());
+            state.pending_replies.insert(
+                id.clone(),
+                PendingReply {
+                    requester_session: session_id.to_string(),
+                    channel: channel.clone(),
+                    acked_by: None,
+                },
+            );
         }
         state
-            .queues
+            .channels
             .entry(channel.clone())
             .or_default()
-            .push_back(event.clone());
+            .queue
+            .push_back(PendingEvent {
+                event: event.clone(),
+                requester_session: session_id.to_string(),
+            });
         "queued"
     } else {
         let mut state = state.lock().await;
         if expects_reply {
-            state
-                .pending_replies
-                .insert(id.clone(), session_id.to_string());
+            state.pending_replies.insert(
+                id.clone(),
+                PendingReply {
+                    requester_session: session_id.to_string(),
+                    channel: channel.clone(),
+                    acked_by: None,
+                },
+            );
         }
         "delivered"
     };
@@ -1283,17 +1231,17 @@ async fn process_poll(
 
         let mut events = Vec::new();
         let mut should_remove = false;
-        if let Some(queue) = state.queues.get_mut(&channel) {
+        if let Some(channel_state) = state.channels.get_mut(&channel) {
             for _ in 0..limit {
-                match queue.pop_front() {
-                    Some(event) => events.push(event),
+                match channel_state.queue.pop_front() {
+                    Some(event) => events.push(event.event),
                     None => break,
                 }
             }
-            should_remove = queue.is_empty();
+            should_remove = channel_state.queue.is_empty() && channel_state.members.is_empty();
         }
         if should_remove {
-            state.queues.remove(&channel);
+            state.channels.remove(&channel);
         }
 
         (sender, events)
@@ -1313,25 +1261,39 @@ async fn process_ack(
     let id = required_field(frame.id, "id")?;
     let ok = frame.ok.unwrap_or(frame.error.is_none());
     let sender = current_sender(state, session_id).await?;
-    let requester_sender = {
+    let ack_result = {
         let mut state = state.lock().await;
-        let Some(requester_id) = state.pending_replies.remove(&id) else {
+        let Some(pending) = state.pending_replies.get_mut(&id) else {
             return Ok(vec![Outbound {
                 sender,
                 frame: WireMessage::error(format!("request {id} is not waiting for a reply")),
             }]);
         };
 
+        if let Some(acked_by) = &pending.acked_by {
+            return Ok(vec![Outbound {
+                sender,
+                frame: WireMessage::warning(format!(
+                    "request {id} already accepted first ack from {acked_by}; dropped duplicate reply"
+                )),
+            }]);
+        }
+
+        pending.acked_by = Some(session_id.to_string());
+        let requester_session = pending.requester_session.clone();
+        let pending_channel = pending.channel.clone();
+
         state
             .clients
-            .get(&requester_id)
+            .get(&requester_session)
             .map(|client| client.sender.clone())
+            .map(|requester_sender| (requester_sender, pending_channel))
     };
 
-    let Some(requester_sender) = requester_sender else {
+    let Some((requester_sender, _pending_channel)) = ack_result else {
         return Ok(vec![Outbound {
             sender,
-            frame: WireMessage::error(format!("requester for {id} is no longer connected")),
+            frame: WireMessage::warning(format!("requester for {id} is no longer connected")),
         }]);
     };
 
@@ -1365,22 +1327,59 @@ async fn cleanup_connection(state: &Arc<Mutex<RelayState>>, session_id: &str) {
         return;
     };
 
-    let mut empty_subscriptions = Vec::new();
+    let mut empty_channels = Vec::new();
     for channel in &client.channels {
-        if let Some(members) = state.subscriptions.get_mut(channel) {
-            members.remove(session_id);
-            if members.is_empty() {
-                empty_subscriptions.push(channel.clone());
+        if let Some(channel_state) = state.channels.get_mut(channel) {
+            channel_state.members.remove(session_id);
+            channel_state.receivers.remove(session_id);
+            channel_state
+                .queue
+                .retain(|event| event.requester_session != session_id);
+            if channel_state.members.is_empty() {
+                empty_channels.push(channel.clone());
             }
         }
     }
-    for channel in empty_subscriptions {
-        state.subscriptions.remove(&channel);
+    for channel in empty_channels {
+        state.channels.remove(&channel);
     }
 
     state
         .pending_replies
-        .retain(|_, waiter| waiter != session_id);
+        .retain(|_, pending| pending.requester_session != session_id);
+
+    for outbound in channel_state_actions(&state) {
+        let _ = dispatch(outbound);
+    }
+}
+
+fn client_receives_events(role: &str) -> bool {
+    matches!(role, "browser" | "receiver" | "worker")
+}
+
+fn active_channel_list(state: &RelayState) -> Vec<String> {
+    let mut channels = state.channels.keys().cloned().collect::<Vec<_>>();
+    channels.sort();
+    channels
+}
+
+fn channel_state_actions(state: &RelayState) -> Vec<Outbound> {
+    let channels = active_channel_list(state);
+    state
+        .clients
+        .values()
+        .map(|client| Outbound {
+            sender: client.sender.clone(),
+            frame: WireMessage::channel_state(channels.clone()),
+        })
+        .collect()
+}
+
+fn active_channel_names(actions: &[Outbound]) -> Vec<String> {
+    actions
+        .first()
+        .map(|outbound| outbound.frame.channels.clone())
+        .unwrap_or_default()
 }
 
 fn dispatch(outbound: Outbound) -> Result<()> {
@@ -1420,69 +1419,8 @@ fn decode_frame(text: &str) -> Result<WireMessage> {
     wire_message_from_edn(edn)
 }
 
-fn validate_genui_layout(layout: &Edn) -> Result<()> {
-    let root: GenUiLayoutNode = decode_edn(layout.clone(), "genui layout")?;
-    validate_genui_node(&root, "root")
-}
-
-fn validate_genui_node(node: &GenUiLayoutNode, path: &str) -> Result<()> {
-    match node.node_type.as_str() {
-        "column" | "row" | "card" => {
-            for (index, child) in node.children.iter().enumerate() {
-                validate_genui_node(child, &format!("{path}.children[{index}]"))?;
-            }
-            Ok(())
-        }
-        "text" => require_string_field(path, "text", node.text.as_deref()),
-        "badge" => require_string_field(path, "text", node.text.as_deref()),
-        "divider" => Ok(()),
-        "button" => require_string_field(path, "text", node.text.as_deref()),
-        "markdown" => require_string_field(path, "text", node.text.as_deref()),
-        "mermaid" => require_string_field(path, "text", node.text.as_deref()),
-        "chart" => validate_chart_series(&node.series, path),
-        "input" => {
-            if node.name.as_deref().is_none() && node.placeholder.as_deref().is_none() {
-                bail!("{path} input node requires at least one of `name` or `placeholder`");
-            }
-            Ok(())
-        }
-        other => bail!("{path} has unsupported node type `{other}`"),
-    }
-}
-
-fn require_string_field(path: &str, field_name: &str, value: Option<&str>) -> Result<()> {
-    match value {
-        Some(value) if !value.is_empty() => Ok(()),
-        _ => bail!("{path} requires a non-empty `{field_name}` field"),
-    }
-}
-
-fn validate_chart_series(series: &[GenUiChartItem], path: &str) -> Result<()> {
-    if series.is_empty() {
-        bail!("{path} chart node requires non-empty `series`");
-    }
-
-    for (index, item) in series.iter().enumerate() {
-        if item.label.is_empty() {
-            bail!("{path}.series[{index}] requires non-empty `label`");
-        }
-        if !item.value.is_finite() {
-            bail!("{path}.series[{index}] requires finite `value`");
-        }
-    }
-
-    Ok(())
-}
-
 fn parse_edn_text(text: &str, label: &str) -> Result<Edn> {
     cirru_edn::parse(text).map_err(|error| anyhow!("failed to parse Cirru EDN {label}: {error}"))
-}
-
-fn decode_edn<T>(edn: Edn, label: &str) -> Result<T>
-where
-    T: DeserializeOwned,
-{
-    cirru_edn::from_edn(edn).map_err(|error| anyhow!("failed to decode Cirru EDN {label}: {error}"))
 }
 
 fn wire_message_to_edn(frame: &WireMessage) -> Edn {
