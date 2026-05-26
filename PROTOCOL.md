@@ -255,15 +255,88 @@ worker 或命令行可以主动从服务端拉取队列里的事件。
 
 ## 7. CLI 对应关系
 
-- `serve`: 启动中继服务
+- `serve`: 启动中继服务，并把当前 relay 目标写入本地状态
+- `current`: 查看当前 relay 上下文
+- `status`: 向 renderer 查询当前页面状态
+- `open`: 查询当前 renderer 页面地址并交给系统浏览器打开
 - `genui`: 向固定的 `genui` channel 发送经过校验的布局描述，并等待浏览器确认已经存入 store 且可渲染
+- `help`: 向 renderer 查询帮助文档
+- `skill`: 向 renderer 查询 skill 文本
 - `send`: 发送 `request` 并阻塞等待 `ack`
 - `poll`: 拉取指定 channel 的队列事件
 - `reply`: 发送 `ack`
 
-当前 CLI 的 stdout 都输出协议帧本身的 Cirru EDN 文本，便于脚本继续解析。
+当前 `help` / `skill` 一类高层命令不应把文档硬编码在 CLI 内部，而是通过协议向当前 renderer 查询。
 
-## 8. `genui` 频道约定
+当前 CLI 的 stdout 都输出协议帧本身的 Cirru EDN 文本，或直接输出 renderer 返回的文本内容，便于脚本继续解析。
+
+## 8. renderer 文档查询频道约定
+
+除了 `genui` 以外，当前还保留一个 `renderer` 频道，用于查询 renderer 暴露的运行时文档能力。
+
+### 8.1 `help` 请求
+
+CLI 通过 `request(channel=renderer)` 发送：
+
+```cirru
+{}
+  :op |help
+  :topics $ [] |chart |mermaid
+```
+
+字段说明：
+
+- `:op` 固定为 `help`
+- `:topics` 可选，用于按名称筛选组件说明；为空时返回全部概览
+
+renderer 成功处理后，返回 `ack(ok=true)`，其中 `payload` 为一段 Cirru EDN map，至少包含：
+
+- `:status`
+- `:kind`
+- `:renderer`
+- `:commands`
+- `:components`
+
+### 8.2 `skill` 请求
+
+CLI 通过 `request(channel=renderer)` 发送：
+
+```cirru
+{}
+  :op |skill
+```
+
+renderer 成功处理后，返回 `ack(ok=true)`，其中 `payload` 至少包含：
+
+- `:status`
+- `:kind`
+- `:renderer`
+- `:title`
+- `:text`
+
+其中 `:text` 是 renderer 当前暴露出来的 skill 内容。
+
+### 8.3 `status` 请求
+
+CLI 通过 `request(channel=renderer)` 发送：
+
+```cirru
+{}
+  :op |status
+```
+
+renderer 成功处理后，返回 `ack(ok=true)`，其中 `payload` 至少包含：
+
+- `:status`
+- `:kind`
+- `:renderer`
+- `:title`
+- `:page_url`
+- `:commands`
+
+`open` 命令可以基于这份返回结果里的 `:page_url` 调用系统浏览器。
+
+## 9. `genui` 频道约定
 
 `genui` 是给 `edn-renderer` 这类前端渲染器使用的保留频道。
 
