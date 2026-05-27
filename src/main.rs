@@ -4,10 +4,7 @@ use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::env;
 use std::fmt::Write as _;
-use std::fs;
-use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
@@ -31,13 +28,21 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     Serve {
-        /// Bind address for the relay server. Defaults to the saved target or 127.0.0.1:9100.
+        /// Bind address for the relay server. Defaults to 127.0.0.1:9100.
         #[arg(long)]
         bind: Option<String>,
+    },
+    Channels {
+        /// Relay websocket URL. Defaults to ws://127.0.0.1:9100.
+        #[arg(long)]
+        server: Option<String>,
     },
     Help {
         /// Optional help topics to query from the receiver.
         topics: Vec<String>,
+        /// Relay websocket URL. Defaults to ws://127.0.0.1:9100.
+        #[arg(long)]
+        server: Option<String>,
         /// Channel name for this request.
         #[arg(long)]
         channel: String,
@@ -49,6 +54,9 @@ enum Command {
         timeout_secs: u64,
     },
     Skill {
+        /// Relay websocket URL. Defaults to ws://127.0.0.1:9100.
+        #[arg(long)]
+        server: Option<String>,
         /// Channel name for this request.
         #[arg(long)]
         channel: String,
@@ -60,6 +68,9 @@ enum Command {
         timeout_secs: u64,
     },
     Status {
+        /// Relay websocket URL. Defaults to ws://127.0.0.1:9100.
+        #[arg(long)]
+        server: Option<String>,
         /// Channel name for this request.
         #[arg(long)]
         channel: String,
@@ -70,8 +81,10 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         timeout_secs: u64,
     },
-    Current,
     Open {
+        /// Relay websocket URL. Defaults to ws://127.0.0.1:9100.
+        #[arg(long)]
+        server: Option<String>,
         /// Channel name for this request.
         #[arg(long)]
         channel: String,
@@ -81,8 +94,19 @@ enum Command {
         /// Timeout in seconds while waiting for an ack.
         #[arg(long, default_value_t = 30)]
         timeout_secs: u64,
+    },
+    OpenPublished {
+        /// Relay websocket URL. Defaults to ws://127.0.0.1:9100.
+        #[arg(long)]
+        server: Option<String>,
+        /// Channel name to preselect in the published renderer.
+        #[arg(long)]
+        channel: String,
     },
     Send {
+        /// Relay websocket URL. Defaults to ws://127.0.0.1:9100.
+        #[arg(long)]
+        server: Option<String>,
         /// Channel name for this request.
         #[arg(long)]
         channel: String,
@@ -97,6 +121,9 @@ enum Command {
         timeout_secs: u64,
     },
     Poll {
+        /// Relay websocket URL. Defaults to ws://127.0.0.1:9100.
+        #[arg(long)]
+        server: Option<String>,
         /// Channel name to poll.
         #[arg(long)]
         channel: String,
@@ -303,10 +330,8 @@ struct Outbound {
 type ClientSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const DEFAULT_BIND: &str = "127.0.0.1:9100";
-#[derive(Debug, Clone)]
-struct RelayCliState {
-    server: Option<String>,
-}
+const DEFAULT_SERVER: &str = "ws://127.0.0.1:9100";
+const PUBLISHED_RENDERER_URL: &str = "https://r.tiye.me/Erigeron/edn-renderer/";
 
 #[tokio::main]
 async fn main() {
@@ -321,50 +346,64 @@ async fn run() -> Result<()> {
 
     match cli.command {
         Command::Serve { bind } => {
-            let bind = resolve_bind(bind)?;
-            let mut state = load_cli_state()?.unwrap_or(RelayCliState { server: None });
-            state.server = Some(server_url_from_bind(&bind));
-            save_cli_state(&state)?;
-            run_server(bind).await
+            let bind = resolve_bind(bind);
+            let listener = bind_listener(&bind).await?;
+            run_server(listener, bind).await
         }
+        Command::Channels { server } => run_channels(resolve_server(server)).await,
         Command::Help {
             topics,
+            server,
             channel,
             client_id,
             timeout_secs,
-        } => run_help(resolve_server()?, channel, topics, client_id, timeout_secs).await,
+        } => run_help(resolve_server(server), channel, topics, client_id, timeout_secs).await,
         Command::Skill {
+            server,
             channel,
             client_id,
             timeout_secs,
-        } => run_skill(resolve_server()?, channel, client_id, timeout_secs).await,
+        } => run_skill(resolve_server(server), channel, client_id, timeout_secs).await,
         Command::Status {
+            server,
             channel,
             client_id,
             timeout_secs,
-        } => run_status(resolve_server()?, channel, client_id, timeout_secs).await,
-        Command::Current => run_current(),
+        } => run_status(resolve_server(server), channel, client_id, timeout_secs).await,
         Command::Open {
+            server,
             channel,
             client_id,
             timeout_secs,
-        } => run_open(resolve_server()?, channel, client_id, timeout_secs).await,
+        } => run_open(resolve_server(server), channel, client_id, timeout_secs).await,
+        Command::OpenPublished { server, channel } => {
+            run_open_published(resolve_server(server), channel)
+        }
         Command::Send {
+            server,
             channel,
             payload,
             client_id,
             timeout_secs,
-        } => run_send(resolve_server()?, channel, payload, client_id, timeout_secs).await,
+        } => run_send(resolve_server(server), channel, payload, client_id, timeout_secs).await,
         Command::Poll {
+            server,
             channel,
             limit,
             client_id,
-        } => run_poll(resolve_server()?, channel, limit, client_id).await,
+        } => run_poll(resolve_server(server), channel, limit, client_id).await,
     }
 }
 
-async fn run_server(bind: String) -> Result<()> {
-    let listener = TcpListener::bind(&bind).await?;
+async fn bind_listener(bind: &str) -> Result<TcpListener> {
+    TcpListener::bind(bind).await.map_err(|error| {
+        anyhow!(
+            "failed to bind relay server on `{bind}`: {error}. If another process already uses this address, stop it first or choose a different `--bind`."
+        )
+    })
+}
+
+async fn run_server(listener: TcpListener, bind: String) -> Result<()> {
     let state = Arc::new(Mutex::new(RelayState::default()));
     eprintln!("listening on ws://{bind}");
 
@@ -379,69 +418,12 @@ async fn run_server(bind: String) -> Result<()> {
     }
 }
 
-fn state_file_path() -> Result<PathBuf> {
-    let home = env::var("HOME").map_err(|_| anyhow!("HOME is not set"))?;
-    Ok(PathBuf::from(home).join(".config").join("edn-relay.cirru"))
+fn resolve_bind(bind: Option<String>) -> String {
+    bind.unwrap_or_else(|| DEFAULT_BIND.to_string())
 }
 
-fn load_cli_state() -> Result<Option<RelayCliState>> {
-    let path = state_file_path()?;
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let text = fs::read_to_string(&path)?;
-    let edn = parse_edn_text(&text, "relay state file")?;
-    let map = expect_map(edn, "relay state file")?;
-    let server = map_string(&map, "server")?;
-    Ok(Some(RelayCliState { server }))
-}
-
-fn save_cli_state(state: &RelayCliState) -> Result<()> {
-    let path = state_file_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let mut pairs = Vec::new();
-    if let Some(server) = &state.server {
-        pairs.push((Edn::tag("server"), Edn::str(server.clone())));
-    }
-    let edn = Edn::map_from_iter(pairs);
-    let text = cirru_edn::format(&edn, true)
-        .map_err(|error| anyhow!("failed to format relay state file: {error}"))?;
-    fs::write(path, text)?;
-    Ok(())
-}
-
-fn server_url_from_bind(bind: &str) -> String {
-    format!("ws://{bind}")
-}
-
-fn resolve_bind(bind: Option<String>) -> Result<String> {
-    if let Some(bind) = bind {
-        return Ok(bind);
-    }
-
-    if let Some(state) = load_cli_state()? {
-        if let Some(server) = state.server {
-            if let Some(bind) = server.strip_prefix("ws://") {
-                return Ok(bind.to_string());
-            }
-        }
-    }
-
-    Ok(DEFAULT_BIND.to_string())
-}
-
-fn resolve_server() -> Result<String> {
-    if let Some(state) = load_cli_state()? {
-        if let Some(server) = state.server {
-            return Ok(server);
-        }
-    }
-
-    bail!("no relay target configured; run `edn-relay serve` first")
+fn resolve_server(server: Option<String>) -> String {
+    server.unwrap_or_else(|| DEFAULT_SERVER.to_string())
 }
 
 async fn run_send(
@@ -472,9 +454,15 @@ async fn run_help(
             Edn::List(EdnListView(topics.into_iter().map(Edn::str).collect())),
         ),
     ]);
-    let ack =
-        send_request_and_wait_for_ack(server, channel, payload, client_id, timeout_secs).await?;
-    print_renderer_response(ack)
+    let ack = send_request_and_wait_for_ack(
+        server,
+        channel.clone(),
+        payload,
+        client_id,
+        timeout_secs,
+    )
+    .await?;
+    print_renderer_response(&channel, ack)
 }
 
 async fn run_skill(
@@ -484,9 +472,15 @@ async fn run_skill(
     timeout_secs: u64,
 ) -> Result<()> {
     let payload = Edn::map_from_iter([(Edn::tag("op"), Edn::str("skill".to_owned()))]);
-    let ack =
-        send_request_and_wait_for_ack(server, channel, payload, client_id, timeout_secs).await?;
-    print_renderer_response(ack)
+    let ack = send_request_and_wait_for_ack(
+        server,
+        channel.clone(),
+        payload,
+        client_id,
+        timeout_secs,
+    )
+    .await?;
+    print_renderer_response(&channel, ack)
 }
 
 async fn run_status(
@@ -499,25 +493,30 @@ async fn run_status(
     print_renderer_status(&status)
 }
 
-fn run_current() -> Result<()> {
-    let path = state_file_path()?;
-    match load_cli_state()? {
-        Some(state) => {
-            println!("当前 relay 上下文");
-            println!("  状态文件: {}", path.display());
-            println!(
-                "  server: {}",
-                state.server.unwrap_or_else(|| "(unset)".into())
-            );
-            Ok(())
-        }
-        None => {
-            println!("当前 relay 上下文");
-            println!("  状态文件: {}", path.display());
-            println!("  尚未初始化；先运行 `edn-relay serve`");
-            Ok(())
+async fn run_channels(server: String) -> Result<()> {
+    let channels = fetch_active_channels(&server).await?;
+    println!("relay: {server}");
+    if channels.is_empty() {
+        println!("  no active channels with connected receivers");
+        println!(
+            "  you can run `edn-relay open-published --channel genui` to bootstrap a published renderer, or open a local page and subscribe it to a channel first."
+        );
+    } else {
+        println!("  active channels:");
+        for channel in channels {
+            println!("    - {channel}");
         }
     }
+    Ok(())
+}
+
+fn run_open_published(server: String, channel: String) -> Result<()> {
+    let url = build_published_renderer_url(&channel, &server);
+    open_url(&url)?;
+    println!("opened {url}");
+    println!("  channel: {channel}");
+    println!("  relay: {server}");
+    Ok(())
 }
 
 async fn run_open(
@@ -539,8 +538,14 @@ async fn fetch_renderer_status(
     timeout_secs: u64,
 ) -> Result<RendererStatusPayload> {
     let payload = Edn::map_from_iter([(Edn::tag("op"), Edn::str("status".to_owned()))]);
-    let ack =
-        send_request_and_wait_for_ack(server, channel, payload, client_id, timeout_secs).await?;
+    let ack = send_request_and_wait_for_ack(
+        server,
+        channel.clone(),
+        payload,
+        client_id,
+        timeout_secs,
+    )
+    .await?;
 
     if !ack.ok.unwrap_or(false) {
         bail!(
@@ -549,13 +554,17 @@ async fn fetch_renderer_status(
         );
     }
 
-    let payload = ack
-        .payload
-        .ok_or_else(|| anyhow!("renderer ack is missing payload"))?;
-    renderer_status_from_payload(payload)
+    let payload = ack.payload.ok_or_else(|| {
+        anyhow!(
+            "channel `{channel}` replied, but the receiver did not return a renderer status payload"
+        )
+    })?;
+    renderer_status_from_payload(payload).map_err(|error| {
+        anyhow!("channel `{channel}` replied, but it does not look like an `edn-renderer` status payload: {error}")
+    })
 }
 
-fn print_renderer_response(ack: WireMessage) -> Result<()> {
+fn print_renderer_response(channel: &str, ack: WireMessage) -> Result<()> {
     if !ack.ok.unwrap_or(false) {
         bail!(
             ack.error
@@ -563,9 +572,9 @@ fn print_renderer_response(ack: WireMessage) -> Result<()> {
         );
     }
 
-    let payload = ack
-        .payload
-        .ok_or_else(|| anyhow!("renderer ack is missing payload"))?;
+    let payload = ack.payload.ok_or_else(|| {
+        anyhow!("channel `{channel}` replied, but the receiver did not return a renderer payload")
+    })?;
 
     if let Edn::Map(map) = payload.clone() {
         if matches!(map_string(&map, "kind")?.as_deref(), Some("help")) {
@@ -604,7 +613,7 @@ fn print_renderer_help_payload(map: &EdnMapView) -> Result<()> {
 
     if !commands.is_empty() {
         writeln!(&mut output, "")?;
-        writeln!(&mut output, "可用命令:")?;
+        writeln!(&mut output, "Available commands:")?;
         for command in commands {
             writeln!(&mut output, "  - edn-relay {command}")?;
         }
@@ -614,9 +623,9 @@ fn print_renderer_help_payload(map: &EdnMapView) -> Result<()> {
     if !components.is_empty() {
         writeln!(&mut output, "")?;
         if topics.is_empty() {
-            writeln!(&mut output, "组件说明:")?;
+            writeln!(&mut output, "Components:")?;
         } else {
-            writeln!(&mut output, "组件说明(筛选: {}):", topics.join(", "))?;
+            writeln!(&mut output, "Components (filtered by: {}):", topics.join(", "))?;
         }
         for component in components {
             writeln!(&mut output, "")?;
@@ -625,10 +634,10 @@ fn print_renderer_help_payload(map: &EdnMapView) -> Result<()> {
                 writeln!(&mut output, "  {}", component.summary)?;
             }
             if !component.fields.is_empty() {
-                writeln!(&mut output, "  字段: {}", component.fields.join(", "))?;
+                writeln!(&mut output, "  Fields: {}", component.fields.join(", "))?;
             }
             if !component.example.is_empty() {
-                writeln!(&mut output, "  示例:")?;
+                writeln!(&mut output, "  Example:")?;
                 for line in component.example.lines() {
                     writeln!(&mut output, "    {line}")?;
                 }
@@ -639,7 +648,7 @@ fn print_renderer_help_payload(map: &EdnMapView) -> Result<()> {
 
     if !protocol_docs.is_empty() {
         writeln!(&mut output, "")?;
-        writeln!(&mut output, "协议摘要:")?;
+        writeln!(&mut output, "Protocol summary:")?;
         for item in protocol_docs {
             writeln!(&mut output, "  - {}: {}", item.name, item.summary)?;
         }
@@ -648,7 +657,7 @@ fn print_renderer_help_payload(map: &EdnMapView) -> Result<()> {
 
     if !example_docs.is_empty() {
         writeln!(&mut output, "")?;
-        writeln!(&mut output, "示例:")?;
+        writeln!(&mut output, "Examples:")?;
         for item in example_docs {
             writeln!(&mut output, "")?;
             writeln!(&mut output, "- {}", item.name)?;
@@ -667,7 +676,7 @@ fn print_renderer_help_payload(map: &EdnMapView) -> Result<()> {
 
     if !has_section {
         writeln!(&mut output, "")?;
-        writeln!(&mut output, "没有匹配的帮助主题。")?;
+        writeln!(&mut output, "No matching help topics were returned.")?;
     }
 
     print!("{output}");
@@ -814,6 +823,26 @@ fn open_url(url: &str) -> Result<()> {
     bail!("open is not supported on this platform")
 }
 
+fn build_published_renderer_url(channel: &str, server: &str) -> String {
+    format!(
+        "{PUBLISHED_RENDERER_URL}?channel={}&server={}",
+        url_encode_component(channel),
+        url_encode_component(server)
+    )
+}
+
+fn url_encode_component(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            let _ = write!(&mut encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+
 async fn send_request_and_wait_for_ack(
     server: String,
     channel: String,
@@ -823,6 +852,7 @@ async fn send_request_and_wait_for_ack(
 ) -> Result<WireMessage> {
     let mut socket = connect_client(&server).await?;
     let request_id = Uuid::new_v4().to_string();
+    let request_channel = channel.clone();
 
     send_client_frame(
         &mut socket,
@@ -838,11 +868,28 @@ async fn send_request_and_wait_for_ack(
     let ack = timeout(Duration::from_secs(timeout_secs), async {
         loop {
             let Some(frame) = read_client_frame(&mut socket).await? else {
-                bail!("server closed the connection before returning an ack");
+                bail!(
+                    "relay closed the connection before request `{}` on channel `{}` received an ack. The relay may have restarted; try again after reconnecting the receiver.",
+                    request_id,
+                    request_channel
+                );
             };
 
             match frame.kind.as_str() {
-                "hello-ok" | "accepted" => continue,
+                "hello-ok" => continue,
+                "accepted" if frame.id.as_deref() == Some(request_id.as_str()) => {
+                    match frame.status.as_deref() {
+                        Some("queued") => bail!(missing_channel_receiver_message(&request_channel)),
+                        Some("delivered") | None => continue,
+                        Some(other) => bail!(
+                            "request {} entered unexpected relay state `{}` on channel `{}`",
+                            request_id,
+                            other,
+                            request_channel
+                        ),
+                    }
+                }
+                "accepted" => continue,
                 "warning" => continue,
                 "ack" if frame.id.as_deref() == Some(request_id.as_str()) => return Ok(frame),
                 "error" => {
@@ -856,9 +903,44 @@ async fn send_request_and_wait_for_ack(
         }
     })
     .await
-    .map_err(|_| anyhow!("timed out waiting for ack for request {}", request_id))??;
+    .map_err(|_| {
+        anyhow!(
+            "timed out waiting for an ack on channel `{}` after {}s. The request may have reached a receiver, but no reply came back. Use `edn-relay channels` to inspect active channels, or reopen a renderer with `edn-relay open-published --channel {}`.",
+            request_channel,
+            timeout_secs,
+            request_channel
+        )
+    })??;
 
     Ok(ack)
+}
+
+fn missing_channel_receiver_message(channel: &str) -> String {
+    format!(
+        "channel `{channel}` does not have an active receiver connection yet. Run `edn-relay channels` to inspect active channels. If you want to bootstrap a renderer quickly, run `edn-relay open-published --channel {channel}`. If you are using a local page, open it first, subscribe it to that channel, and then rerun the command."
+    )
+}
+
+async fn fetch_active_channels(server: &str) -> Result<Vec<String>> {
+    let mut socket = connect_client(server).await?;
+    send_client_frame(&mut socket, &WireMessage::hello("cli", None, vec![])).await?;
+
+    loop {
+        let Some(frame) = read_client_frame(&mut socket).await? else {
+            bail!("relay closed the connection before returning the active channel list");
+        };
+
+        match frame.kind.as_str() {
+            "hello-ok" | "channel-state" => return Ok(frame.channels),
+            "error" => {
+                let message = frame
+                    .error
+                    .unwrap_or_else(|| "server returned an error".into());
+                bail!(message);
+            }
+            _ => continue,
+        }
+    }
 }
 
 async fn run_poll(
@@ -902,7 +984,27 @@ async fn run_poll(
 }
 
 async fn connect_client(server: &str) -> Result<ClientSocket> {
-    let (socket, _) = connect_async(server).await?;
+    let (socket, _) = connect_async(server).await.map_err(|error| {
+        let details = error.to_string();
+        if details.contains("Connection refused") {
+            anyhow!(
+                "failed to connect to relay `{server}`: connection refused. Start or restart the relay with `edn-relay serve --bind {}`, or pass `--server` explicitly when the relay is listening elsewhere."
+                , DEFAULT_BIND
+            )
+        } else if details.contains("failed to lookup address information")
+            || details.contains("dns")
+            || details.contains("DNS")
+        {
+            anyhow!(
+                "failed to resolve relay address `{server}`: {details}. Check your `--server` value, or start a local relay with `edn-relay serve --bind {}`."
+                , DEFAULT_BIND
+            )
+        } else {
+            anyhow!(
+                "failed to connect to relay `{server}`: {details}. Make sure the relay is reachable, and pass `--server` explicitly if you are not using the default `{DEFAULT_SERVER}`."
+            )
+        }
+    })?;
     Ok(socket)
 }
 
@@ -1358,7 +1460,12 @@ fn client_receives_events(role: &str) -> bool {
 }
 
 fn active_channel_list(state: &RelayState) -> Vec<String> {
-    let mut channels = state.channels.keys().cloned().collect::<Vec<_>>();
+    let mut channels = state
+        .channels
+        .iter()
+        .filter(|(_, channel_state)| !channel_state.receivers.is_empty())
+        .map(|(channel, _)| channel.clone())
+        .collect::<Vec<_>>();
     channels.sort();
     channels
 }

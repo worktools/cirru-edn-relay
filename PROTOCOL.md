@@ -282,16 +282,16 @@ worker 或命令行可以主动从服务端拉取队列里的事件。
 
 ## 7. CLI 对应关系
 
-- `serve`: 启动中继服务，并把当前 relay 目标写入本地状态
-- `current`: 查看当前 relay 上下文
-- `status`: 通过 `--channel <name>` 向对应 renderer 查询页面状态
+- `serve`: 启动中继服务，默认监听 `127.0.0.1:9100`，也可用 `--bind` 覆盖
+- `channels`: 查看指定 relay 上当前有哪些 channel 已经有 receiver 连接
+- `status`: 通过 `--channel <name>` 向对应 renderer 查询页面状态；必要时用 `--server <WS_URL>` 指定 relay
 - `open`: 查询当前 renderer 页面地址并交给系统浏览器打开
 - `help`: 向 renderer 查询帮助文档
 - `skill`: 向 renderer 查询 skill 文本
 - `send`: 发送 `request` 并阻塞等待 `ack`，命令最后一个位置参数直接作为 `payload`
 - `poll`: 拉取指定 channel 的队列事件
 
-当前 `help` / `skill` 一类高层命令不应把文档硬编码在 CLI 内部，而是通过协议向当前 renderer 查询。
+当前 `help` / `skill` 一类高层命令不应把文档硬编码在 CLI 内部，而是通过协议向指定 channel 上的 renderer 查询。
 
 当前 CLI 的 stdout 都输出协议帧本身的 Cirru EDN 文本，或直接输出 renderer 返回的文本内容，便于脚本继续解析。
 

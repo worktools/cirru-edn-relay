@@ -27,9 +27,9 @@
 
 - 优先保持依赖简单，避免为了小功能引入完整 web 框架
 - 若需要扩展浏览器接入，优先复用现有 `hello/request/event/ack/poll` 协议，不先拆新协议
-- relay 的本地持久化状态统一放在 `~/.config/edn-relay.cirru`
-- 面向用户的命令尽量默认读取当前 relay 状态，不要要求每次重复填写服务地址和端口
-- `help` / `skill` 这类高层命令应通过协议查询当前 renderer，不要把文档硬编码在 relay CLI 里
+- relay CLI 采用无状态约定：请求类命令默认连接 `ws://127.0.0.1:9100`，需要其他 relay 时显式传 `--server`
+- channel 始终由每次命令上的 `--channel` 决定，不维护“当前 channel”
+- `help` / `skill` 这类高层命令应通过协议查询目标 channel 上的 renderer，不要把文档硬编码在 relay CLI 里
 - 如果增加测试，优先补 websocket 集成测试，覆盖 `send -> event -> ack`、`request -> queue -> poll -> reply` 和 `CLI -> renderer docs/skill query`
 
 ## 5. 交付检查
