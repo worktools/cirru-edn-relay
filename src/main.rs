@@ -50,6 +50,8 @@ enum Command {
     timeout_secs: u64,
   },
   Skill {
+    /// Optional skill topics to query from the receiver.
+    topics: Vec<String>,
     /// Relay websocket URL. Defaults to ws://127.0.0.1:9100.
     #[arg(long)]
     server: Option<String>,
@@ -355,11 +357,12 @@ async fn run() -> Result<()> {
       timeout_secs,
     } => run_help(resolve_server(server), channel, topics, client_id, timeout_secs).await,
     Command::Skill {
+      topics,
       server,
       channel,
       client_id,
       timeout_secs,
-    } => run_skill(resolve_server(server), channel, client_id, timeout_secs).await,
+    } => run_skill(resolve_server(server), channel, topics, client_id, timeout_secs).await,
     Command::Status {
       server,
       channel,
@@ -428,19 +431,13 @@ async fn run_send(server: String, channel: String, payload: String, client_id: O
 }
 
 async fn run_help(server: String, channel: String, topics: Vec<String>, client_id: Option<String>, timeout_secs: u64) -> Result<()> {
-  let payload = Edn::map_from_iter([
-    (Edn::tag("op"), Edn::str("help".to_owned())),
-    (
-      Edn::tag("topics"),
-      Edn::List(EdnListView(topics.into_iter().map(Edn::str).collect())),
-    ),
-  ]);
+  let payload = renderer_topic_request_payload("help", topics);
   let ack = send_request_and_wait_for_ack(server, channel.clone(), payload, client_id, timeout_secs).await?;
   print_renderer_response(&channel, ack)
 }
 
-async fn run_skill(server: String, channel: String, client_id: Option<String>, timeout_secs: u64) -> Result<()> {
-  let payload = Edn::map_from_iter([(Edn::tag("op"), Edn::str("skill".to_owned()))]);
+async fn run_skill(server: String, channel: String, topics: Vec<String>, client_id: Option<String>, timeout_secs: u64) -> Result<()> {
+  let payload = renderer_topic_request_payload("skill", topics);
   let ack = send_request_and_wait_for_ack(server, channel.clone(), payload, client_id, timeout_secs).await?;
   print_renderer_response(&channel, ack)
 }
@@ -489,7 +486,7 @@ async fn fetch_renderer_status(
   client_id: Option<String>,
   timeout_secs: u64,
 ) -> Result<RendererStatusPayload> {
-  let payload = Edn::map_from_iter([(Edn::tag("op"), Edn::str("status".to_owned()))]);
+  let payload = Edn::tuple(Edn::tag("status"), Vec::new());
   let ack = send_request_and_wait_for_ack(server, channel.clone(), payload, client_id, timeout_secs).await?;
 
   if !ack.ok.unwrap_or(false) {
@@ -762,6 +759,13 @@ fn url_encode_component(value: &str) -> String {
     }
   }
   encoded
+}
+
+fn renderer_topic_request_payload(op: &str, topics: Vec<String>) -> Edn {
+  Edn::tuple(
+    Edn::tag(op),
+    vec![Edn::List(EdnListView(topics.into_iter().map(Edn::str).collect()))],
+  )
 }
 
 async fn send_request_and_wait_for_ack(
@@ -1373,13 +1377,13 @@ fn parse_edn_text(text: &str, label: &str) -> Result<Edn> {
 
 fn wire_message_to_edn(frame: &WireMessage) -> Edn {
   let mut pairs = Vec::new();
-  pairs.push((Edn::tag("kind"), Edn::str(frame.kind.clone())));
+  pairs.push((Edn::tag("kind"), Edn::tag(frame.kind.as_str())));
 
   if let Some(id) = &frame.id {
     pairs.push((Edn::tag("id"), Edn::str(id.clone())));
   }
   if let Some(role) = &frame.role {
-    pairs.push((Edn::tag("role"), Edn::str(role.clone())));
+    pairs.push((Edn::tag("role"), Edn::tag(role.as_str())));
   }
   if let Some(client_id) = &frame.client_id {
     pairs.push((Edn::tag("client_id"), Edn::str(client_id.clone())));
@@ -1418,7 +1422,7 @@ fn wire_message_to_edn(frame: &WireMessage) -> Edn {
     pairs.push((Edn::tag("from"), Edn::str(from.clone())));
   }
   if let Some(status) = &frame.status {
-    pairs.push((Edn::tag("status"), Edn::str(status.clone())));
+    pairs.push((Edn::tag("status"), Edn::tag(status.as_str())));
   }
 
   Edn::map_from_iter(pairs)

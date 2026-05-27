@@ -7,6 +7,8 @@
 - websocket 地址示例: `ws://127.0.0.1:9100`
 - 每一帧都是一个 Cirru EDN map，对应 Rust 侧的 `WireMessage`
 - 顶层字段名固定，采用 snake_case
+- 可枚举的协议语义优先使用 tag，例如 `:hello`、`:receiver`、`:queued`；relay 继续兼容旧的 string 写法
+- 固定结构、且开头是协议枚举的 payload，优先使用 tuple，例如 `(:: :help ([] |math))`；长度不固定的同类集合继续使用 `[]`
 - `payload` 字段直接承载 Cirru EDN 数据，不再把数据额外包一层字符串
 - `channel` 用于路由消息，同一个 channel 可以有多个 sender、receiver 或 worker
 - 只要某个 channel 里还有任意一方在线，该 channel 就视为存在；所有连接退出后该 channel 消失
@@ -21,8 +23,8 @@
 
 字段说明:
 
-- `kind`: 固定为 `"hello"`
-- `role`: `"receiver"`、`"sender"`、`"worker"`；当前仍兼容旧值 `"browser"` 和 `"cli"`
+- `kind`: 固定为 `:hello`
+- `role`: `:receiver`、`:sender`、`:worker`；当前仍兼容旧值 `|browser` 和 `|cli`
 - `client_id`: 可选，客户端自定义标识；不传时由服务端回填 session id
 - `channels`: 可选数组，表示当前连接当前要加入的频道列表；browser/receiver 通常只放 0 或 1 个
 
@@ -30,8 +32,8 @@
 
 ```cirru
 {}
-  :kind |hello
-  :role |receiver
+  :kind :hello
+  :role :receiver
   :client_id |page-main
   :channels $ [] |demo
 ```
@@ -40,7 +42,7 @@
 
 服务端确认握手成功后返回:
 
-- `kind`: 固定为 `"hello-ok"`
+- `kind`: 固定为 `:hello-ok`
 - `client_id`: 服务端最终确认的连接标识
 - `channels`: 当前活跃的 channel 列表
 
@@ -48,7 +50,7 @@
 
 ```cirru
 {}
-  :kind |hello-ok
+  :kind :hello-ok
   :client_id |page-main
   :channels $ [] |demo
 ```
@@ -57,14 +59,14 @@
 
 当活跃 channel 列表变化时，服务端会向在线连接广播:
 
-- `kind`: 固定为 `"channel-state"`
+- `kind`: 固定为 `:channel-state`
 - `channels`: 当前活跃的 channel 列表
 
 示例:
 
 ```cirru
 {}
-  :kind |channel-state
+  :kind :channel-state
   :channels $ [] |alpha |beta
 ```
 
@@ -76,7 +78,7 @@
 
 字段说明:
 
-- `kind`: 固定为 `"request"`
+- `kind`: 固定为 `:request`
 - `id`: 请求 id，后续 `ack` 必须回同一个 id
 - `channel`: 路由频道
 - `payload`: 一段合法的 Cirru EDN 数据
@@ -86,11 +88,11 @@
 
 ```cirru
 {}
-  :kind |request
+  :kind :request
   :id |0a94a0b0-8e6b-46dd-9ab4-1f6e0f88d8c7
   :channel |demo
   :expects_reply true
-  :payload $ {} (:op |ping) (:value 1)
+  :payload $ (:: :help ([] |math))
 ```
 
 ### accepted
@@ -99,10 +101,10 @@
 
 字段说明:
 
-- `kind`: 固定为 `"accepted"`
+- `kind`: 固定为 `:accepted`
 - `id`: 原请求 id
 - `channel`: 原 channel
-- `status`: `"delivered"` 或 `"queued"`
+- `status`: `:delivered` 或 `:queued`
 
 语义:
 
@@ -115,7 +117,7 @@
 
 字段说明:
 
-- `kind`: 固定为 `"event"`
+- `kind`: 固定为 `:event`
 - `id`: 原请求 id
 - `channel`: 原 channel
 - `from`: 发送方 `client_id`
@@ -125,11 +127,11 @@
 
 ```cirru
 {}
-  :kind |event
+  :kind :event
   :id |0a94a0b0-8e6b-46dd-9ab4-1f6e0f88d8c7
   :channel |demo
   :from |cli-a
-  :payload $ {} (:op |ping) (:value 1)
+  :payload $ (:: :help ([] |math))
 ```
 
 ### ack
@@ -138,7 +140,7 @@
 
 字段说明:
 
-- `kind`: 固定为 `"ack"`
+- `kind`: 固定为 `:ack`
 - `id`: 原请求 id
 - `ok`: 是否成功
 - `payload`: 可选，一段合法的 Cirru EDN 数据
@@ -154,7 +156,7 @@
 
 ```cirru
 {}
-  :kind |ack
+  :kind :ack
   :id |0a94a0b0-8e6b-46dd-9ab4-1f6e0f88d8c7
   :ok true
   :payload $ {} (:result |pong)
@@ -164,7 +166,7 @@
 
 ```cirru
 {}
-  :kind |ack
+  :kind :ack
   :id |0a94a0b0-8e6b-46dd-9ab4-1f6e0f88d8c7
   :ok false
   :error |permission-denied
@@ -174,14 +176,14 @@
 
 服务端已成功把 `ack` 路由给原发送方时，返回给回执提交者:
 
-- `kind`: 固定为 `"reply-accepted"`
+- `kind`: 固定为 `:reply-accepted`
 - `id`: 已确认路由的请求 id
 
 ### warning
 
 服务端在不需要中断连接、但需要提示行为被忽略时返回:
 
-- `kind`: 固定为 `"warning"`
+- `kind`: 固定为 `:warning`
 - `error`: 警告文本
 
 目前主要用于多 receiver 场景下的重复 `ack`。
@@ -194,7 +196,7 @@ worker 或命令行可以主动从服务端拉取队列里的事件。
 
 字段说明:
 
-- `kind`: 固定为 `"poll"`
+- `kind`: 固定为 `:poll`
 - `channel`: 要拉取的频道
 - `limit`: 最多返回多少条，最小按 1 处理
 
@@ -202,7 +204,7 @@ worker 或命令行可以主动从服务端拉取队列里的事件。
 
 ```cirru
 {}
-  :kind |poll
+  :kind :poll
   :channel |demo
   :limit 10
 ```
@@ -213,7 +215,7 @@ worker 或命令行可以主动从服务端拉取队列里的事件。
 
 字段说明:
 
-- `kind`: 固定为 `"poll-result"`
+- `kind`: 固定为 `:poll-result`
 - `channel`: 拉取的频道
 - `events`: 数组，每个元素都等价于一个 `event` 载荷
 
@@ -221,7 +223,7 @@ worker 或命令行可以主动从服务端拉取队列里的事件。
 
 ```cirru
 {}
-  :kind |poll-result
+  :kind :poll-result
   :channel |demo
   :events $ [] $ {}
     :id |0a94a0b0-8e6b-46dd-9ab4-1f6e0f88d8c7
@@ -242,14 +244,14 @@ worker 或命令行可以主动从服务端拉取队列里的事件。
 
 服务端遇到协议错误、字段缺失、回执 id 无效等情况时返回:
 
-- `kind`: 固定为 `"error"`
+- `kind`: 固定为 `:error`
 - `error`: 错误描述文本
 
 示例:
 
 ```cirru
 {}
-  :kind |error
+  :kind :error
   :error |missing-required-field-channel
 ```
 
