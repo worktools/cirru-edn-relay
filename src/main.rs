@@ -14,6 +14,9 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, accept_async, connect_async};
 use uuid::Uuid;
 
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 5;
+const CHROME_DEVTOOLS_CMD: &str = "chrome-devtools";
+
 #[derive(Parser, Debug)]
 #[command(version, about = "Cirru EDN websocket relay", disable_help_subcommand = true)]
 struct Cli {
@@ -46,7 +49,7 @@ enum Command {
     #[arg(long)]
     client_id: Option<String>,
     /// Timeout in seconds while waiting for an ack.
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = DEFAULT_REQUEST_TIMEOUT_SECS)]
     timeout_secs: u64,
   },
   Skill {
@@ -62,7 +65,7 @@ enum Command {
     #[arg(long)]
     client_id: Option<String>,
     /// Timeout in seconds while waiting for an ack.
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = DEFAULT_REQUEST_TIMEOUT_SECS)]
     timeout_secs: u64,
   },
   Status {
@@ -76,7 +79,7 @@ enum Command {
     #[arg(long)]
     client_id: Option<String>,
     /// Timeout in seconds while waiting for an ack.
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = DEFAULT_REQUEST_TIMEOUT_SECS)]
     timeout_secs: u64,
   },
   Open {
@@ -90,7 +93,7 @@ enum Command {
     #[arg(long)]
     client_id: Option<String>,
     /// Timeout in seconds while waiting for an ack.
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = DEFAULT_REQUEST_TIMEOUT_SECS)]
     timeout_secs: u64,
   },
   OpenPublished {
@@ -115,7 +118,7 @@ enum Command {
     #[arg(long)]
     client_id: Option<String>,
     /// Timeout in seconds while waiting for an ack.
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = DEFAULT_REQUEST_TIMEOUT_SECS)]
     timeout_secs: u64,
   },
   Poll {
@@ -644,6 +647,13 @@ struct RendererStatusPayload {
   commands: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+struct ChromeDevtoolsPage {
+  id: String,
+  url: String,
+  selected: bool,
+}
+
 fn map_components(map: &EdnMapView, key: &str) -> Result<Vec<RendererComponentDoc>> {
   match map_value(map, key) {
     Some(Edn::Nil) | None => Ok(Vec::new()),
@@ -768,6 +778,106 @@ fn renderer_topic_request_payload(op: &str, topics: Vec<String>) -> Edn {
   )
 }
 
+fn run_command(program: &str, args: &[&str]) -> Result<String> {
+  let output = ProcessCommand::new(program)
+    .args(args)
+    .output()
+    .map_err(|error| anyhow!("failed to run `{program} {}`: {error}", args.join(" ")))?;
+
+  if output.status.success() {
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+  } else {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let details = if stderr.is_empty() {
+      format!("exit status {}", output.status)
+    } else {
+      stderr
+    };
+    bail!("`{program} {}` failed: {details}", args.join(" "));
+  }
+}
+
+fn parse_chrome_devtools_pages(output: &str) -> Vec<ChromeDevtoolsPage> {
+  output
+    .lines()
+    .filter_map(|line| {
+      let trimmed = line.trim();
+      let (id, rest) = trimmed.split_once(": ")?;
+      if id.parse::<u32>().is_err() {
+        return None;
+      }
+
+      let selected = rest.ends_with(" [selected]");
+      let url = rest.trim_end_matches(" [selected]").trim().to_owned();
+      if url.is_empty() {
+        None
+      } else {
+        Some(ChromeDevtoolsPage {
+          id: id.to_owned(),
+          url,
+          selected,
+        })
+      }
+    })
+    .collect()
+}
+
+fn find_chrome_devtools_page(channel: &str) -> Result<Option<ChromeDevtoolsPage>> {
+  let pages = parse_chrome_devtools_pages(&run_command(CHROME_DEVTOOLS_CMD, &["list_pages"])?);
+  if pages.is_empty() {
+    return Ok(None);
+  }
+
+  let channel_query = format!("channel={channel}");
+  if let Some(page) = pages.iter().find(|page| page.url.contains(&channel_query)) {
+    return Ok(Some(page.clone()));
+  }
+
+  Ok(pages.iter().find(|page| page.selected).cloned().or_else(|| pages.first().cloned()))
+}
+
+fn extract_console_errors(output: &str) -> Vec<String> {
+  output
+    .lines()
+    .map(str::trim)
+    .filter(|line| line.starts_with("msgid=") && (line.contains("[error]") || line.contains("[warn]")))
+    .map(ToOwned::to_owned)
+    .collect()
+}
+
+fn collect_chrome_console_diagnostics(channel: &str) -> Option<String> {
+  match find_chrome_devtools_page(channel) {
+    Ok(Some(page)) => {
+      let select_result = run_command(CHROME_DEVTOOLS_CMD, &["select_page", &page.id]);
+      let console_result = run_command(CHROME_DEVTOOLS_CMD, &["list_console_messages"]);
+
+      let mut details = Vec::new();
+      details.push(format!("chrome-devtools page: {} {}", page.id, page.url));
+
+      if let Err(error) = select_result {
+        details.push(format!("select_page failed: {error}"));
+      }
+
+      match console_result {
+        Ok(output) => {
+          let errors = extract_console_errors(&output);
+          if errors.is_empty() {
+            details.push("console errors: none reported".to_owned());
+          } else {
+            details.push("console errors:".to_owned());
+            details.extend(errors.into_iter().take(6).map(|line| format!("  {line}")));
+          }
+        }
+        Err(error) => details.push(format!("list_console_messages failed: {error}")),
+      }
+
+      Some(details.join("\n"))
+    }
+    Ok(None) => None,
+    Err(error) => Some(format!("chrome-devtools diagnostics failed: {error}")),
+  }
+}
+
 async fn send_request_and_wait_for_ack(
   server: String,
   channel: String,
@@ -819,15 +929,23 @@ async fn send_request_and_wait_for_ack(
             }
         }
     })
-    .await
-    .map_err(|_| {
-        anyhow!(
-            "timed out waiting for an ack on channel `{}` after {}s. The request may have reached a receiver, but no reply came back. Use `edn-relay channels` to inspect active channels, or reopen a renderer with `edn-relay open-published --channel {}`.",
-            request_channel,
-            timeout_secs,
-            request_channel
-        )
-    })??;
+    .await;
+
+  let ack = match ack {
+    Ok(result) => result?,
+    Err(_) => {
+      let mut message = format!(
+        "timed out waiting for an ack on channel `{}` after {}s. The request may have reached a receiver, but no reply came back. Use `edn-relay channels` to inspect active channels, reopen a renderer with `edn-relay open-published --channel {}`, or pass `--timeout-secs` to wait longer.",
+        request_channel, timeout_secs, request_channel
+      );
+
+      if let Some(diagnostics) = collect_chrome_console_diagnostics(&request_channel) {
+        write!(&mut message, "\n\nBrowser diagnostics:\n{diagnostics}")?;
+      }
+
+      return Err(anyhow!(message));
+    }
+  };
 
   Ok(ack)
 }
