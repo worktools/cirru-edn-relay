@@ -34,6 +34,9 @@ This installs the command as `edn-relay`.
 ```bash
 edn-relay serve
 edn-relay channels
+edn-relay help --channel genui
+edn-relay skill --channel genui
+edn-relay status --channel genui
 edn-relay open --channel genui
 edn-relay open-published --channel genui
 edn-relay send --channel demo '{} (:op |ping) (:value 1)'
