@@ -365,6 +365,146 @@ renderer 成功处理后，返回 `ack(ok=true)`，其中 `payload` 至少包含
 
 `open` 命令可以基于这份返回结果里的 `:page_url` 调用系统浏览器。
 
+### 8.4 `layout` 请求
+
+用于查询 renderer 当前持有的 layout summary tree，适合作为局部编辑的第一步。
+
+CLI 上更推荐直接发送 map 形式：
+
+```cirru
+{}
+  :op :layout
+```
+
+按子树查询时，也可以附 `path`：
+
+```cirru
+{}
+  :op :layout
+  :path |2.1
+```
+
+如果你是程序里直接构造 Cirru EDN，也兼容 tuple 形式，例如 `(:: :layout)` 或 `(:: :layout |2.1)`。
+
+路径约定：
+
+- `root` 表示整棵 tree
+- 其他路径使用 children 的 1-based 索引，例如 `1`、`2.1`、`3.2.4`
+
+renderer 成功处理后，返回 `ack(ok=true)`，其中 `payload` 至少包含：
+
+- `:status`
+- `:kind`，固定为 `:layout`
+- `:layout_id`
+- `:path`
+- `:summary`
+
+其中 `:summary` 是隐藏节点细节的 summary tree，默认包含：
+
+- `:path`
+- `:type`
+- `:child-count`
+
+并可能按组件类型附带少量摘要字段，例如文本类节点的 `:text`、图表节点的 `:series-count`、MathML 节点的 `:expr-tag`。
+
+### 8.5 `node` 请求
+
+用于按路径读取某个节点的完整 DSL。
+
+CLI 上更推荐：
+
+```cirru
+{}
+  :op :node
+  :path |1.2
+```
+
+如果你是程序里直接构造 Cirru EDN，也兼容 tuple 形式，例如 `(:: :node |1.2)`。
+
+renderer 成功处理后，返回 `ack(ok=true)`，其中 `payload` 至少包含：
+
+- `:status`
+- `:kind`，固定为 `:node`
+- `:layout_id`
+- `:path`
+- `:dsl`
+- `:source`
+- `:summary`
+
+其中：
+
+- `:dsl` 是目标节点的 Cirru EDN 数据
+- `:source` 是目标节点格式化后的 Cirru 文本
+- `:summary` 是目标节点对应的摘要视图
+
+### 8.6 `patch` 请求
+
+用于局部合并节点属性，适合只改字段、不改结构的情况。
+
+CLI 上更推荐：
+
+```cirru
+{}
+  :op :patch
+  :path |1
+  :changes $ {}
+    :text "|Updated title"
+```
+
+如果你是程序里直接构造 Cirru EDN，也兼容 tuple 形式，例如 `(:: :patch |1 $ {} (:text "|Updated title"))`。
+
+renderer 会先把 `:changes` 合并到目标节点，再重新验证整棵 layout。成功后返回 `ack(ok=true)`，其中 `payload` 至少包含：
+
+- `:status`
+- `:kind`，固定为 `:patch`
+- `:layout_id`
+- `:path`
+- `:dsl`
+- `:summary`
+
+如果合并后的 tree 校验失败，则应返回 `ack(ok=false)`，并在 `:error` 中放置校验失败文本。
+
+### 8.7 `replace` 请求
+
+用于按路径替换整棵子树，适合结构性修改。
+
+CLI 上更推荐：
+
+```cirru
+{}
+  :op :replace
+  :path |2.1
+  :node $ {}
+    :type |text
+    :text "|Replaced from CLI"
+```
+
+如果你是程序里直接构造 Cirru EDN，也兼容 tuple 形式，例如 `(:: :replace |2.1 $ {} (:type |text) (:text "|Replaced from CLI"))`。
+
+历史兼容上，也允许 map 形式使用 `:dsl` 作为替换节点字段。
+
+renderer 会先替换目标子树，再重新验证整棵 layout。成功后返回 `ack(ok=true)`，其中 `payload` 至少包含：
+
+- `:status`
+- `:kind`，固定为 `:replace`
+- `:layout_id`
+- `:path`
+- `:dsl`
+- `:summary`
+
+如果替换后的 tree 校验失败，则应返回 `ack(ok=false)`，并在 `:error` 中放置校验失败文本。
+
+### 8.8 推荐的渐进编辑顺序
+
+对已经渲染出来的页面，更推荐下面的顺序，而不是每次都重发整棵 layout：
+
+1. 先发 `:layout` 获取 summary tree
+2. 再发 `:node` 读取目标节点 DSL
+3. 只改属性时优先 `:patch`
+4. 改结构时再用 `:replace`
+
+这样 agent 可以先看轮廓，再钻到局部，最后只更新需要修改的子树。
+
 ## 9. receiver 侧 payload 约定
 
 像 `genui` 这样的 channel 名称只是发送方与 receiver 之间的约定。relay 只负责转发 Cirru EDN `payload`，不在 CLI 或协议层硬编码具体的数据结构。
