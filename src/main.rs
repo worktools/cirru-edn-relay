@@ -1410,10 +1410,10 @@ struct StorageLoadedEntry {
 fn save_storage_entry(channel: &str, requested_name: Option<String>, entry: &Edn) -> Result<StorageSavedEntry> {
   let dir = ensure_storage_channel_dir(channel)?;
   let file_name = requested_name
-    .map(|name| sanitize_storage_name(&name))
+    .map(|name| sanitize_storage_file_name(&name))
     .filter(|name| !name.is_empty())
     .unwrap_or_else(|| default_storage_file_name(entry));
-  let file_path = dir.join(format!("{file_name}.cirru"));
+  let file_path = dir.join(&file_name);
   let source = cirru_edn::format(entry, true).map_err(|error| anyhow!("failed to format storage entry: {error}"))?;
   fs::write(&file_path, source).map_err(|error| anyhow!("failed to write storage entry `{}`: {error}", file_path.display()))?;
 
