@@ -188,7 +188,97 @@
 
 目前主要用于多 receiver 场景下的重复 `ack`。
 
-## 4. 队列拉取
+## 4. 内部存储服务
+
+relay 预留了一个内部 channel `__relay_store__`，用于给前端或其他 client
+提供通用的本地文件存取能力。这个 channel 不转发给普通 receiver，而是由
+relay 自己直接处理并返回 `accepted` 和 `ack`。
+
+当前支持 3 个操作，payload 都放在 `request.payload` 里:
+
+- `:save`: 保存一份 Cirru EDN entry 到 `~/.config/ed-relay/<channel>/`
+- `:list`: 列出某个 channel 目录下已保存的文件
+- `:load`: 读取某个已保存文件，并把原始 entry 和源码一起返回
+
+### save
+
+示例:
+
+```cirru
+{}
+  :kind :request
+  :id |storage-save-1
+  :channel |__relay_store__
+  :payload $ {}
+    :op :save
+    :channel |genui
+    :name |demo-report.cirru
+    :entry $ {}
+      :kind :saved-report
+      :layout $ {}
+        :type |text
+        :text |Hello
+```
+
+成功时 `ack.payload` 形如:
+
+```cirru
+{}
+  :kind :storage-save
+  :status :ok
+  :channel |genui
+  :name |demo-report.cirru
+  :path |/Users/example/.config/ed-relay/genui/demo-report.cirru
+```
+
+### list
+
+示例:
+
+```cirru
+{}
+  :kind :request
+  :id |storage-list-1
+  :channel |__relay_store__
+  :payload $ {}
+    :op :list
+    :channel |genui
+```
+
+成功时 `ack.payload` 会返回 `:entries`，每个元素至少包含 `:name` 和 `:path`。
+
+### load
+
+示例:
+
+```cirru
+{}
+  :kind :request
+  :id |storage-load-1
+  :channel |__relay_store__
+  :payload $ {}
+    :op :load
+    :channel |genui
+    :name |demo-report.cirru
+```
+
+成功时 `ack.payload` 形如:
+
+```cirru
+{}
+  :kind :storage-load
+  :status :ok
+  :channel |genui
+  :name |demo-report.cirru
+  :entry $ {}
+    :kind :saved-report
+    :layout $ {}
+      :type |text
+      :text |Hello
+  :source "{}\n  :kind :saved-report ..."
+```
+
+## 5. 队列拉取
 
 ### poll
 

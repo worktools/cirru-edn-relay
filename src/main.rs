@@ -4,7 +4,9 @@ use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
 use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
@@ -16,6 +18,8 @@ use uuid::Uuid;
 
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 5;
 const CHROME_DEVTOOLS_CMD: &str = "chrome-devtools";
+const INTERNAL_STORAGE_CHANNEL: &str = "__relay_store__";
+const INTERNAL_STORAGE_ROOT: &str = ".config/ed-relay";
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Cirru EDN websocket relay", disable_help_subcommand = true)]
@@ -1222,6 +1226,10 @@ async fn process_request(state: &Arc<Mutex<RelayState>>, session_id: &str, frame
   let channel = required_field(frame.channel, "channel")?;
   let payload = required_value(frame.payload, "payload")?;
 
+  if channel == INTERNAL_STORAGE_CHANNEL {
+    return process_internal_storage_request(state, session_id, id, payload).await;
+  }
+
   let expects_reply = frame.expects_reply.unwrap_or(true);
   let (requester_sender, requester_id, recipients) = {
     let mut state = state.lock().await;
@@ -1302,6 +1310,224 @@ async fn process_request(state: &Arc<Mutex<RelayState>>, session_id: &str, frame
     });
   }
   Ok(actions)
+}
+
+async fn process_internal_storage_request(
+  state: &Arc<Mutex<RelayState>>,
+  session_id: &str,
+  id: String,
+  payload: Edn,
+) -> Result<Vec<Outbound>> {
+  let sender = current_sender(state, session_id).await?;
+  let response = handle_internal_storage_payload(payload)?;
+
+  Ok(vec![
+    Outbound {
+      sender: sender.clone(),
+      frame: WireMessage::accepted(id.clone(), INTERNAL_STORAGE_CHANNEL.into(), "delivered"),
+    },
+    Outbound {
+      sender,
+      frame: WireMessage::ack(id, true, Some(response), None),
+    },
+  ])
+}
+
+fn handle_internal_storage_payload(payload: Edn) -> Result<Edn> {
+  let map = expect_map(payload, "internal storage payload")?;
+  let op = required_map_string(&map, "op")?;
+  let channel = required_map_string(&map, "channel")?;
+
+  match op.as_str() {
+    "save" => {
+      let entry = required_value(map_edn(&map, "entry"), "entry")?;
+      let requested_name = map_string(&map, "name")?;
+      let saved = save_storage_entry(&channel, requested_name, &entry)?;
+      Ok(Edn::map_from_iter([
+        (Edn::tag("status"), Edn::tag("ok")),
+        (Edn::tag("kind"), Edn::tag("storage-save")),
+        (Edn::tag("channel"), Edn::str(channel)),
+        (Edn::tag("name"), Edn::str(saved.file_name)),
+        (Edn::tag("path"), Edn::str(saved.file_path)),
+      ]))
+    }
+    "list" => {
+      let entries = list_storage_entries(&channel)?;
+      Ok(Edn::map_from_iter([
+        (Edn::tag("status"), Edn::tag("ok")),
+        (Edn::tag("kind"), Edn::tag("storage-list")),
+        (Edn::tag("channel"), Edn::str(channel)),
+        (
+          Edn::tag("entries"),
+          Edn::List(EdnListView(
+            entries
+              .into_iter()
+              .map(|entry| {
+                Edn::map_from_iter([
+                  (Edn::tag("name"), Edn::str(entry.file_name)),
+                  (Edn::tag("path"), Edn::str(entry.file_path)),
+                ])
+              })
+              .collect(),
+          )),
+        ),
+      ]))
+    }
+    "load" => {
+      let name = required_map_string(&map, "name")?;
+      let loaded = load_storage_entry(&channel, &name)?;
+      Ok(Edn::map_from_iter([
+        (Edn::tag("status"), Edn::tag("ok")),
+        (Edn::tag("kind"), Edn::tag("storage-load")),
+        (Edn::tag("channel"), Edn::str(channel)),
+        (Edn::tag("name"), Edn::str(loaded.file_name)),
+        (Edn::tag("path"), Edn::str(loaded.file_path)),
+        (Edn::tag("entry"), loaded.entry),
+        (Edn::tag("source"), Edn::str(loaded.source)),
+      ]))
+    }
+    other => bail!("unsupported internal storage op: {other}"),
+  }
+}
+
+struct StorageSavedEntry {
+  file_name: String,
+  file_path: String,
+}
+
+struct StorageListEntry {
+  file_name: String,
+  file_path: String,
+}
+
+struct StorageLoadedEntry {
+  file_name: String,
+  file_path: String,
+  source: String,
+  entry: Edn,
+}
+
+fn save_storage_entry(channel: &str, requested_name: Option<String>, entry: &Edn) -> Result<StorageSavedEntry> {
+  let dir = ensure_storage_channel_dir(channel)?;
+  let file_name = requested_name
+    .map(|name| sanitize_storage_name(&name))
+    .filter(|name| !name.is_empty())
+    .unwrap_or_else(|| default_storage_file_name(entry));
+  let file_path = dir.join(format!("{file_name}.cirru"));
+  let source = cirru_edn::format(entry, true).map_err(|error| anyhow!("failed to format storage entry: {error}"))?;
+  fs::write(&file_path, source).map_err(|error| anyhow!("failed to write storage entry `{}`: {error}", file_path.display()))?;
+
+  Ok(StorageSavedEntry {
+    file_name: file_path
+      .file_name()
+      .and_then(|name| name.to_str())
+      .unwrap_or_default()
+      .to_owned(),
+    file_path: file_path.display().to_string(),
+  })
+}
+
+fn list_storage_entries(channel: &str) -> Result<Vec<StorageListEntry>> {
+  let dir = storage_channel_dir(channel)?;
+  if !dir.exists() {
+    return Ok(Vec::new());
+  }
+
+  let mut entries = fs::read_dir(&dir)
+    .map_err(|error| anyhow!("failed to read storage directory `{}`: {error}", dir.display()))?
+    .filter_map(|entry| entry.ok())
+    .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("cirru"))
+    .map(|entry| StorageListEntry {
+      file_name: entry.file_name().to_string_lossy().into_owned(),
+      file_path: entry.path().display().to_string(),
+    })
+    .collect::<Vec<_>>();
+
+  entries.sort_by(|left, right| left.file_name.cmp(&right.file_name));
+  Ok(entries)
+}
+
+fn load_storage_entry(channel: &str, name: &str) -> Result<StorageLoadedEntry> {
+  let file_name = sanitize_storage_file_name(name);
+  let file_path = storage_channel_dir(channel)?.join(&file_name);
+  if !file_path.exists() {
+    bail!("storage entry `{file_name}` does not exist for channel `{channel}`");
+  }
+
+  let source = fs::read_to_string(&file_path)
+    .map_err(|error| anyhow!("failed to read storage entry `{}`: {error}", file_path.display()))?;
+  let entry = parse_edn_text(&source, "stored entry")?;
+
+  Ok(StorageLoadedEntry {
+    file_name,
+    file_path: file_path.display().to_string(),
+    source,
+    entry,
+  })
+}
+
+fn ensure_storage_channel_dir(channel: &str) -> Result<PathBuf> {
+  let dir = storage_channel_dir(channel)?;
+  fs::create_dir_all(&dir).map_err(|error| anyhow!("failed to create storage directory `{}`: {error}", dir.display()))?;
+  Ok(dir)
+}
+
+fn storage_channel_dir(channel: &str) -> Result<PathBuf> {
+  let root = storage_root_dir()?;
+  Ok(root.join(sanitize_storage_name(channel)))
+}
+
+fn storage_root_dir() -> Result<PathBuf> {
+  let home = std::env::var("HOME").map_err(|_| anyhow!("HOME is not set; cannot resolve relay storage directory"))?;
+  Ok(Path::new(&home).join(INTERNAL_STORAGE_ROOT))
+}
+
+fn sanitize_storage_name(name: &str) -> String {
+  name
+    .chars()
+    .map(|ch| {
+      if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+        ch
+      } else {
+        '_'
+      }
+    })
+    .collect::<String>()
+    .trim_matches('_')
+    .to_owned()
+}
+
+fn sanitize_storage_file_name(name: &str) -> String {
+  let mut file_name = sanitize_storage_name(name);
+  if !file_name.ends_with(".cirru") {
+    file_name.push_str(".cirru");
+  }
+  file_name
+}
+
+fn default_storage_file_name(entry: &Edn) -> String {
+  let timestamp = js_timestamp_string();
+  if let Edn::Map(map) = entry {
+    let title = map
+      .tag_get("title")
+      .or_else(|| map.tag_get("layout_id"))
+      .or_else(|| map.tag_get("request_id"))
+      .and_then(|value| edn_as_string(value, "storage file name").ok())
+      .map(|value| sanitize_storage_name(&value))
+      .filter(|value| !value.is_empty());
+    if let Some(title) = title {
+      return format!("{timestamp}-{title}");
+    }
+  }
+  format!("{timestamp}-report")
+}
+
+fn js_timestamp_string() -> String {
+  let now = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .unwrap_or_default()
+    .as_secs();
+  now.to_string()
 }
 
 async fn process_poll(state: &Arc<Mutex<RelayState>>, session_id: &str, frame: WireMessage) -> Result<Vec<Outbound>> {
